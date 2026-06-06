@@ -1,6 +1,20 @@
-import { ref, get } from "firebase/database";
+import { ref, get, update } from "firebase/database";
 import { rtdb } from "../database.js";
 
+import jwt from "jsonwebtoken";
+
+// Me function eka thamai athulath wena token eka check karanne
+const getAuthUser = (req) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
+
+  const token = authHeader.split(" ")[1];
+  try {
+    return jwt.verify(token, process.env.JWT_SECRET); // Token eka decode karanawa
+  } catch (err) {
+    return null;
+  }
+};
 export const getAllData = async (req, res) => {
   try {
     const snapshot = await get(ref(rtdb, "/"));
@@ -573,9 +587,14 @@ export async function getTotalOutput(req, res) {
     const snapshot = await get(ref(rtdb, `Machines/${machineId}/CounterHistory`));
 
     if (!snapshot.exists()) {
-      return res.status(404).json({
-        success: false,
-        message: "No CounterHistory found",
+      return res.status(200).json({
+        success: true,
+        machineId,
+        date: date || new Date().toISOString().split("T")[0],
+        totalOutput: 0,
+        currentHour: "N/A",
+        currentHourOutput: 0,
+        hourlyData: hours.map((hour) => ({ hour, output: 0 })), // සියලුම පැය වලට 0 යවයි
       });
     }
 
@@ -745,42 +764,64 @@ export async function getProductionGaps(req, res) {
     });
   }
 }
-
 export const assignLine = async (req, res) => {
-  const { lineId, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, supervisor, shiftStartTime, shiftEndTime } = req.body;
+  const user = getAuthUser(req);
+
+  // 1. User ලොග් වී නැත්නම්
+  if (!user) {
+    return res.status(401).json({ success: false, message: "Unauthorized: No token provided." });
+  }
+
+  // 2. Roles තුනම අනුමත වන පරිදි සකසන්න
+  const allowedRoles = ["Admin", "Supervisor", "Superuser"];
+
+  if (!allowedRoles.includes(user.role)) {
+    return res.status(403).json({
+      success: false,
+      message: `Access Denied: Your role '${user.role}' does not have permission to assign lines.`,
+    });
+  }
+
+  const { lineId, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, supervisor, shiftStartTime, shiftEndTime, floor } = req.body;
+
+  if (!lineId) {
+    return res.status(400).json({ success: false, message: "Line ID is required." });
+  }
 
   try {
-    // Lines/{lineId} යන පථයට දත්ත Update කිරීම
-    const lineRef = ref(database, `Lines/${lineId}`);
-
+    const lineRef = ref(rtdb, `Lines/${lineId}`);
     await update(lineRef, {
-      machineId,
-      productCode,
-      dailyTarget: Number(dailyTarget),
-      hourlyTarget: Number(hourlyTarget),
-      plannedMembers: Number(teamMembers),
-      shift,
-      supervisor,
-      shiftStartTime,
-      shiftEndTime,
+      machineId: machineId || "",
+      productCode: productCode || "",
+      dailyTarget: Number(dailyTarget) || 0,
+      hourlyTarget: Number(hourlyTarget) || 0,
+      plannedMembers: Number(teamMembers) || 0,
+      shift: shift || "",
+      supervisor: supervisor || "",
+      shiftStartTime: shiftStartTime || "",
+      shiftEndTime: shiftEndTime || "",
+      floor: floor || "",
+      assignedBy: user.name,
       assignedAt: new Date().toISOString(),
     });
 
-    return res.status(200).json({
-      success: true,
-      message: `Line ${lineId} assignment updated successfully.`,
-    });
+    return res.status(200).json({ success: true, message: `Line ${lineId} assignment updated successfully.` });
   } catch (error) {
-    console.error("Assignment Error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Failed to update assignment.",
-    });
+    return res.status(500).json({ success: false, message: "Failed to update assignment." });
   }
 };
-// controllers/Esp32DataController.js (අගට එකතු කරන්න)
 
 export const removeAssignment = async (req, res) => {
+  // Remove කිරීමත් Admin/Superuser ට පමණක් සීමා කිරීම වඩාත් ආරක්ෂිතයි
+  const user = getAuthUser(req);
+
+  if (!user || (user.role !== "Admin" && user.role !== "Superuser")) {
+    return res.status(403).json({
+      success: false,
+      message: "Access Denied: Only Admins and Superusers can remove line assignments.",
+    });
+  }
+
   const { lineId } = req.body;
 
   if (!lineId) {
@@ -788,9 +829,7 @@ export const removeAssignment = async (req, res) => {
   }
 
   try {
-    const lineRef = ref(database, `Lines/${lineId}`);
-
-    // අදාළ Line එකේ සියලු දත්ත හිස් (Clear) කිරීම
+    const lineRef = ref(rtdb, `Lines/${lineId}`);
     await update(lineRef, {
       machineId: "",
       productCode: "",
@@ -803,18 +842,137 @@ export const removeAssignment = async (req, res) => {
       shiftStartTime: "",
       shiftEndTime: "",
       floor: "",
+      assignedBy: "",
       assignedAt: "",
+    });
+
+    return res.status(200).json({ success: true, message: `Assignment for ${lineId} removed successfully.` });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to remove assignment." });
+  }
+};
+
+// =========================================================
+// 4. Supervisor අනුව Data Filter කිරීම
+// =========================================================
+
+export const getLinesChanges = async (req, res) => {
+  // කෙලින්ම Token එකෙන් User ව ගන්නවා
+  const user = getAuthUser(req);
+
+  try {
+    const snapshot = await get(ref(rtdb, `Lines`));
+    let lines = snapshot.val() || {};
+
+    // User කෙනෙක් ඉන්නවා නම් සහ ඔහු Supervisor නම් පමණක් Filter කරනවා
+    if (user && user.role === "Supervisor") {
+      const supervisorName = user.name;
+
+      const filteredLines = {};
+      Object.keys(lines).forEach((key) => {
+        if (lines[key].supervisor === supervisorName) {
+          filteredLines[key] = lines[key];
+        }
+      });
+      lines = filteredLines; // Supervisor ට පේන්නේ අදාළ Lines විතරයි
+    }
+
+    res.status(200).json({ success: true, data: lines });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+export const updateLineDetails = async (req, res) => {
+  // 1. Token එකෙන් User ව ලබා ගැනීම (කලින් හැදූ getAuthUser function එක හරහා)
+  const user = getAuthUser(req);
+
+  // 2. Role එක පරීක්ෂා කිරීම (Admin, Superuser හෝ Supervisor පමණක් දැයි බැලීම)
+  const allowedRoles = ["Admin", "Superuser", "Supervisor"];
+  if (!user || !allowedRoles.includes(user.role)) {
+    return res.status(403).json({
+      success: false,
+      message: "Access Denied: Only Admins, Superusers, and Supervisors can update line details.",
+    });
+  }
+
+  // 3. Frontend එකෙන් එවන දත්ත ලබා ගැනීම
+  const { lineId, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, floor } = req.body;
+
+  if (!lineId) {
+    return res.status(400).json({ success: false, message: "Line ID is required." });
+  }
+
+  try {
+    const lineRef = ref(rtdb, `Lines/${lineId}`);
+    const snapshot = await get(lineRef);
+
+    if (!snapshot.exists()) {
+      return res.status(404).json({ success: false, message: "Line not found." });
+    }
+
+    const currentLineData = snapshot.val();
+
+    // 4. Supervisor කෙනෙක් නම්, මේ Line එක ඔහුගේදැයි පරීක්ෂා කිරීම
+    if (user.role === "Supervisor" && currentLineData.supervisor !== user.name) {
+      return res.status(403).json({
+        success: false,
+        message: "Access Denied: You can only update details of lines assigned to you.",
+      });
+    }
+
+    // 5. දත්ත Update කිරීම (Supervisor ට වෙනස් කළ නොහැකි දේවල් වෙන් කර ඇත)
+    // උදාහරණයක් ලෙස Supervisor ගේ නම වෙනස් කිරීමට ඉඩ දී නැත (එය Admin ට පමණක් කළ හැක)
+    await update(lineRef, {
+      machineId: machineId !== undefined ? machineId : currentLineData.machineId,
+      productCode: productCode !== undefined ? productCode : currentLineData.productCode,
+      dailyTarget: dailyTarget !== undefined ? Number(dailyTarget) : currentLineData.dailyTarget,
+      hourlyTarget: hourlyTarget !== undefined ? Number(hourlyTarget) : currentLineData.hourlyTarget,
+      plannedMembers: teamMembers !== undefined ? Number(teamMembers) : currentLineData.plannedMembers,
+      shift: shift !== undefined ? shift : currentLineData.shift,
+      floor: floor !== undefined ? floor : currentLineData.floor,
+      updatedBy: user.name, // දත්ත වෙනස් කළේ කවුද යන්න සටහන් වේ
+      updatedAt: new Date().toISOString(),
     });
 
     return res.status(200).json({
       success: true,
-      message: `Assignment for ${lineId} removed successfully.`,
+      message: `Line ${lineId} details updated successfully.`,
     });
   } catch (error) {
-    console.error("Remove Assignment Error:", error);
+    console.error("Update Line Error:", error);
     return res.status(500).json({
       success: false,
-      message: "Failed to remove assignment.",
+      message: "Failed to update line details.",
     });
+  }
+};
+
+export const getMachineData = async (req, res) => {
+  const { machineId } = req.params; // { } යොදා destructure කරන්න
+
+  try {
+    // ඔබේ Firebase JSON ව්‍යුහය අනුව 'Machines' යන්න Capital අකුරින් තිබේ නම් එයම භාවිතා කරන්න
+    const snapshot = await get(ref(rtdb, `Machines/${machineId}`));
+    const machineData = snapshot.val();
+
+    if (!machineData) {
+      return res.status(404).json({ success: false, message: "Machine not found" });
+    }
+
+    res.status(200).json({ success: true, data: machineData });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+export const getSingleLine = async (req, res) => {
+  const { lineId } = req.params;
+  try {
+    const snapshot = await get(ref(rtdb, `Lines/${lineId}`));
+    if (!snapshot.exists()) {
+      return res.status(404).json({ success: false, message: "Line not found" });
+    }
+    res.status(200).json({ success: true, data: snapshot.val() });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
   }
 };

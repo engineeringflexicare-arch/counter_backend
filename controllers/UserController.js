@@ -1,142 +1,111 @@
-import { addDoc, getDocs, updateDoc, deleteDoc, doc } from "firebase/firestore";
-
+import { addDoc, getDocs, query, where, updateDoc, deleteDoc, doc } from "firebase/firestore";
 import UsersCollection from "../models/User.js";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 
-// Create User
+const JWT_SECRET = process.env.JWT_SECRET;
+
+// ==========================================
+// 1. JWT Middleware
+// ==========================================
+export const verifyToken = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.split(" ")[1];
+
+  if (!token) return res.status(403).json({ success: false, message: "No token provided" });
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    res.status(401).json({ success: false, message: "Unauthorized" });
+  }
+};
+
+// ==========================================
+// 2. Controller Functions
+// ==========================================
+
 export const createUser = async (req, res) => {
   try {
-    const { Firstname, Lastname, Email, Password, Role } = req.body;
+    const { Firstname, Lastname, EmployeeNumber, Password, Role } = req.body;
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(Password, salt);
 
-    const newUser = {
+    await addDoc(UsersCollection, {
       Firstname,
       Lastname,
-      Email,
-      Password,
+      EmployeeNumber,
+      Password: hashedPassword,
       Role,
       CreatedAt: new Date(),
-      UpdatedAt: new Date(),
-    };
-
-    await addDoc(UsersCollection, newUser);
-
-    res.status(201).json({
-      success: true,
-      message: "User created successfully",
     });
+    res.status(201).json({ success: true, message: "User created" });
   } catch (error) {
-    console.error("Create User Error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    res.status(500).json({ success: false, message: error.message });
   }
 };
 
 export const loginUser = async (req, res) => {
   try {
-    const { Email, Password } = req.body;
+    const { EmployeeNumber, Password } = req.body;
+    const q = query(UsersCollection, where("EmployeeNumber", "==", EmployeeNumber));
+    const snapshot = await getDocs(q);
+    console.log();
 
-    const snapshot = await getDocs(UsersCollection);
+    if (snapshot.empty) return res.status(401).json({ message: "Invalid EmployeeNumber" });
 
-    const users = snapshot.docs.map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
+    const userDoc = snapshot.docs[0];
+    const user = { id: userDoc.id, ...userDoc.data() };
 
-    const user = users.find((user) => user.Email === Email);
+    const isMatch = await bcrypt.compare(Password, user.Password);
+    if (!isMatch) return res.status(401).json({ message: "Invalid password" });
 
-    if (user && user.Password === Password) {
-      res.status(200).json({
-        success: true,
-        message: "User logged in successfully",
-      });
-    } else {
-      res.status(401).json({
-        success: false,
-        message: "Invalid email or password",
-      });
-    }
+    const token = jwt.sign({ id: user.id, role: user.Role, name: user.Firstname }, JWT_SECRET, { expiresIn: "1h" });
+    console.log(token);
+    res.status(200).json({ success: true, token, role: user.Role, name: user.Firstname });
   } catch (error) {
-    console.error("Login User Error:", error);
+    res.status(500).json({ message: error.message });
   }
 };
 
-// Get Users
 export const getUsers = async (req, res) => {
   try {
     const snapshot = await getDocs(UsersCollection);
-
-    const users = snapshot.docs.map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-    }));
-
-    res.status(200).json({
-      success: true,
-      data: users,
-    });
+    const users = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    res.status(200).json({ success: true, data: users });
   } catch (error) {
-    console.error("Get Users Error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// Update User
 export const updateUser = async (req, res) => {
   try {
     const { id } = req.params;
-
-    const { Firstname, Lastname, Email, Password, Role } = req.body;
-
+    const { Firstname, Lastname, EmployeeNumber, Role } = req.body;
     const userRef = doc(UsersCollection, id);
 
     await updateDoc(userRef, {
       Firstname,
       Lastname,
-      Email,
-      Password,
+      EmployeeNumber,
       Role,
       UpdatedAt: new Date(),
     });
-
-    res.status(200).json({
-      success: true,
-      message: "User updated successfully",
-    });
+    res.status(200).json({ success: true, message: "User updated" });
   } catch (error) {
-    console.error("Update User Error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// Delete User
 export const deleteUser = async (req, res) => {
   try {
     const { id } = req.params;
-
     const userRef = doc(UsersCollection, id);
-
     await deleteDoc(userRef);
-
-    res.status(200).json({
-      success: true,
-      message: "User deleted successfully",
-    });
+    res.status(200).json({ success: true, message: "User deleted" });
   } catch (error) {
-    console.error("Delete User Error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
+    res.status(500).json({ success: false, message: error.message });
   }
 };

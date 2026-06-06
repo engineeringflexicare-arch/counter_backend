@@ -1,12 +1,14 @@
 import express from "express";
-import { createUser, getUsers, updateUser, deleteUser, loginUser } from "../controllers/UserController.js";
+import { createUser, getUsers, updateUser, deleteUser, loginUser, verifyToken } from "../controllers/UserController.js";
 
 const router = express.Router();
 
 router.post("/", createUser);
 router.post("/login", loginUser);
-router.get("/", getUsers);
-router.put("/:id", updateUser);
-router.delete("/:id", deleteUser);
+
+// ආරක්ෂිත රවුට්ස් (Token අවශ්‍ය වේ)
+router.get("/", verifyToken, getUsers);
+router.put("/:id", verifyToken, updateUser);
+router.delete("/:id", verifyToken, deleteUser);
 
 export default router;
