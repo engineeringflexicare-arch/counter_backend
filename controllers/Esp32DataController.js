@@ -659,3 +659,162 @@ export async function getTotalOutput(req, res) {
     });
   }
 }
+export async function getProductionGaps(req, res) {
+  const { machineId } = req.params;
+  const { date } = req.query;
+
+  try {
+    const snapshot = await get(ref(rtdb, `Machines/${machineId}/CounterHistory`));
+
+    if (!snapshot.exists()) {
+      return res.status(404).json({
+        success: false,
+        message: "No CounterHistory found",
+      });
+    }
+
+    // දින ලබා දී නොමැති නම් අද දිනය ලබා ගැනීම
+    const selectedDate =
+      date ||
+      (() => {
+        const now = new Date();
+        return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+      })();
+
+    // 1. අදාළ දිනයට අදාළ දත්ත පමණක් වෙන් කර, Timestamp එක අනුව පෙළගස්වන්න
+    const history = Object.values(snapshot.val())
+      .filter((item) => {
+        if (!item.Time) return false;
+        const itemDate = item.Time.split(" ")[0].replace(/\//g, "-");
+        return itemDate === selectedDate;
+      })
+      .sort((a, b) => a.timestamp - b.timestamp); // ESP32 එකෙන් එවන Unix Timestamp එකෙන් sort කිරීම
+
+    const gapData = [];
+    let totalGap = 0;
+    let validGapCount = 0;
+
+    // 2. එකකට පසු එකක් එන Count අතර පරතරය තත්පර වලින් ගණනය කිරීම
+    for (let i = 1; i < history.length; i++) {
+      const current = history[i];
+      const previous = history[i - 1];
+
+      // මැෂින් එක Reset වුණ වෙලාවල් මඟහැරීම (Count එක වැඩි වුණා නම් පමණක් ගණනය කිරීම)
+      if (current.Count > previous.Count) {
+        let gapSeconds = 0;
+
+        // ESP32 එකෙන් එවන Timestamp (තත්පර) භාවිතා කර පරතරය සෙවීම
+        if (current.timestamp && previous.timestamp) {
+          gapSeconds = current.timestamp - previous.timestamp;
+        } else {
+          // යම් හෙයකින් Timestamp නොමැති නම්, Time string එකෙන් ගණනය කිරීම
+          const currTime = new Date(current.Time.replace(/\//g, "-")).getTime() / 1000;
+          const prevTime = new Date(previous.Time.replace(/\//g, "-")).getTime() / 1000;
+          gapSeconds = currTime - prevTime;
+        }
+
+        // ඍණ අගයන් හෝ අසාමාන්‍ය පරතරයන් ඉවත් කිරීම
+        if (gapSeconds >= 0) {
+          gapData.push({
+            count: current.Count,
+            time: current.Time.split(" ")[1], // "08:15:30" ලෙස වෙලාව පමණක් වෙන් කිරීම
+            gapSeconds: Math.round(gapSeconds),
+          });
+
+          totalGap += gapSeconds;
+          validGapCount++;
+        }
+      }
+    }
+
+    // 3. සාමාන්‍ය කාල පරතරය (Average Gap) ගණනය කිරීම
+    const averageGap = validGapCount > 0 ? Math.round(totalGap / validGapCount) : 0;
+
+    // 4. ප්‍රතිඵලය Frontend එකට යැවීම
+    return res.status(200).json({
+      success: true,
+      machineId,
+      date: selectedDate,
+      averageGap,
+      data: gapData, // Graph එකට කෙලින්ම දිය හැකි Array එක
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+}
+
+export const assignLine = async (req, res) => {
+  const { lineId, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, supervisor, shiftStartTime, shiftEndTime } = req.body;
+
+  try {
+    // Lines/{lineId} යන පථයට දත්ත Update කිරීම
+    const lineRef = ref(database, `Lines/${lineId}`);
+
+    await update(lineRef, {
+      machineId,
+      productCode,
+      dailyTarget: Number(dailyTarget),
+      hourlyTarget: Number(hourlyTarget),
+      plannedMembers: Number(teamMembers),
+      shift,
+      supervisor,
+      shiftStartTime,
+      shiftEndTime,
+      assignedAt: new Date().toISOString(),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Line ${lineId} assignment updated successfully.`,
+    });
+  } catch (error) {
+    console.error("Assignment Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update assignment.",
+    });
+  }
+};
+// controllers/Esp32DataController.js (අගට එකතු කරන්න)
+
+export const removeAssignment = async (req, res) => {
+  const { lineId } = req.body;
+
+  if (!lineId) {
+    return res.status(400).json({ success: false, message: "Line ID is required." });
+  }
+
+  try {
+    const lineRef = ref(database, `Lines/${lineId}`);
+
+    // අදාළ Line එකේ සියලු දත්ත හිස් (Clear) කිරීම
+    await update(lineRef, {
+      machineId: "",
+      productCode: "",
+      dailyTarget: 0,
+      hourlyTarget: 0,
+      plannedMembers: 0,
+      totalProductCount: 0,
+      shift: "",
+      supervisor: "",
+      shiftStartTime: "",
+      shiftEndTime: "",
+      floor: "",
+      assignedAt: "",
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: `Assignment for ${lineId} removed successfully.`,
+    });
+  } catch (error) {
+    console.error("Remove Assignment Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to remove assignment.",
+    });
+  }
+};
