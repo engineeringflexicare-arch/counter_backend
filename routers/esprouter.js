@@ -1,23 +1,25 @@
 import express from "express";
 
-// පරණ Controller එකෙන් ගන්න දේවල්
 import {
   getAllData,
   getCounterHistory,
   getAllLines,
-  getLineById,
-  getHourlyProductionData,
-  getCombinedProductionGaps,
+  getSingleLine,
+  getLinesChanges,
+  withoutResetCountHourlyData,
+  getTotalOutput,
+  getProductionGaps,
+  assignLine,
+  removeAssignment,
+  updateLineDetails,
   getMachineData,
   getMachineLiveMetrics,
   getLiveDataByLineId,
+  getLineById,
   getHourlyTableData,
   getFreeCounterMachines,
-  getTotalOutput, // 👈 අලුතින් එකතු කළ function එක
+  getProductionGapsByLineId,
 } from "../controllers/Esp32DataController.js";
-
-// අලුත් Line Controller එකෙන් ගන්න දේවල්
-import { assignLine, removeAssignment, updateLineDetails } from "../controllers/LineController.js";
 
 const ESP32DataRouter = express.Router();
 
@@ -25,15 +27,17 @@ const ESP32DataRouter = express.Router();
 // General Data Routes
 // ====================================================
 ESP32DataRouter.get("/", getAllData);
-ESP32DataRouter.get("/lines", getAllLines);
-ESP32DataRouter.get("/lines/:lineId", getLineById);
+ESP32DataRouter.get("/all-lines", getAllLines);
+ESP32DataRouter.get("/lines", getLinesChanges);
+ESP32DataRouter.get("/lines/:lineId", getSingleLine);
+ESP32DataRouter.get("/line/:lineId", getLineById);
 
 // ====================================================
-// Line Management Routes (දැන් LineController එකෙන් ක්‍රියාත්මක වේ)
+// Line Management Routes
 // ====================================================
 ESP32DataRouter.post("/assign-line", assignLine);
 ESP32DataRouter.post("/remove-assignment", removeAssignment);
-ESP32DataRouter.put("/update-line", updateLineDetails); // Note: lineId එක request body එකේ යවන නිසා path එක කෙටි කළා
+ESP32DataRouter.put("/update-line", updateLineDetails);
 
 // ====================================================
 // Machine Data Routes
@@ -41,19 +45,20 @@ ESP32DataRouter.put("/update-line", updateLineDetails); // Note: lineId එක r
 ESP32DataRouter.get("/machine/:machineId", getMachineData);
 ESP32DataRouter.get("/history/:machineId", getCounterHistory);
 ESP32DataRouter.get("/metrics/:machineId", getMachineLiveMetrics);
-ESP32DataRouter.get("/hourly-production/:machineId", getHourlyProductionData);
+ESP32DataRouter.get("/without-reset-hourly/:machineId", withoutResetCountHourlyData);
+ESP32DataRouter.get("/total-output/:machineId", getTotalOutput);
+ESP32DataRouter.get("/production-gaps/:machineId", getProductionGaps);
 ESP32DataRouter.get("/hourly-table/:machineId", getHourlyTableData);
-ESP32DataRouter.get("/:machineId/total-output", getTotalOutput); // 👈 අලුතින් එකතු කළ Route එක (404 Error එක විසඳීමට)
+ESP32DataRouter.get("/production-gaps-by-line/:lineId", getProductionGapsByLineId);
 
 // ====================================================
-// Production Gaps Routes
-// ====================================================
-ESP32DataRouter.get("/production-gaps", getCombinedProductionGaps);
-
-// ====================================================
-// Live Data & Free Machines Routes
+// Live Data Routes
 // ====================================================
 ESP32DataRouter.get("/line-live-data/:lineId", getLiveDataByLineId);
+
+// ====================================================
+// Free Machines Routes
+// ====================================================
 ESP32DataRouter.get("/free-counters", getFreeCounterMachines);
 
 export default ESP32DataRouter;

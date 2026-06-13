@@ -9,11 +9,11 @@ dotenv.config();
 
 const app = express();
 
-// 1. නිවැරදි CORS Configuration
-// පෝට් එක 3001 ලෙස නිවැරදි කර ඇත
+// 1. correct CORS Configuration
+// port correct
 app.use(
   cors({
-    origin: ["http://localhost:3001", "http://localhost:3000"], // අවශ්‍ය පරිදි පෝට් එක දෙන්න
+    origin: ["http://localhost:3001", "http://localhost:3000"], //
     methods: ["GET", "POST", "PUT", "DELETE"],
     credentials: true,
   }),
