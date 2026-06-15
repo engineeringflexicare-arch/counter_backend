@@ -77,51 +77,33 @@ export const createUser = async (req, res) => {
 // --- USER LOGIN (Updated to prevent undefined error) ---
 export const loginUser = async (req, res) => {
   try {
-    // Frontend එකෙන් එවන දත්ත ලබාගැනීම
-    const { email, password, EmployeeNumber, employeeId } = req.body;
+    // Frontend එකෙන් එවන Keys දෙකම ගන්න
+    const { EmployeeNumber, password } = req.body;
 
-    // Email හෝ Employee ID එකක් එවා ඇත්දැයි බැලීම
-    const identifier = email || EmployeeNumber || employeeId;
-
-    if (!identifier || !password) {
-      return res.status(400).json({
-        success: false,
-        message: "Email/Employee ID and Password are required!",
-      });
+    if (!EmployeeNumber || !password) {
+      return res.status(400).json({ success: false, message: "ID and Password are required!" });
     }
 
-    // Database එකේ Search කළ යුතු field එක තීරණය කිරීම (email ද නැත්නම් EmployeeNumber ද කියා)
-    const searchField = email ? "email" : "EmployeeNumber";
-
-    const q = query(UsersCollection, where(searchField, "==", identifier));
+    // Firebase එකේ ගබඩා කර ඇති field එක 'EmployeeNumber' නම් (Case sensitive)
+    const q = query(UsersCollection, where("EmployeeNumber", "==", EmployeeNumber));
     const snapshot = await getDocs(q);
 
     if (snapshot.empty) {
-      return res.status(401).json({ success: false, message: "Invalid credentials or user not found" });
+      return res.status(401).json({ success: false, message: "User not found" });
     }
 
     const userDoc = snapshot.docs[0];
     const user = { id: userDoc.id, ...userDoc.data() };
 
-    // Database එකේ තියෙන password field එක
-    const dbPassword = user.password || user.Password;
-
-    const isMatch = await bcrypt.compare(password, dbPassword);
+    const isMatch = await bcrypt.compare(password, user.password || user.Password);
     if (!isMatch) {
       return res.status(401).json({ success: false, message: "Invalid password" });
     }
 
-    // Token එකේ කාලය පැය 8ක් (8h) දක්වා වැඩි කර ඇත
-    const token = jwt.sign({ id: user.id, role: user.role || user.Role, name: user.name || user.Firstname }, JWT_SECRET, { expiresIn: "8h" });
+    const token = jwt.sign({ id: user.id, role: user.role || user.Role, name: user.name }, JWT_SECRET, { expiresIn: "8h" });
 
-    res.status(200).json({
-      success: true,
-      token,
-      role: user.role || user.Role,
-      name: user.name || user.Firstname,
-    });
+    res.status(200).json({ success: true, token, role: user.role || user.Role, name: user.name });
   } catch (error) {
-    console.error("Login Error:", error);
     res.status(500).json({ success: false, message: error.message });
   }
 };
