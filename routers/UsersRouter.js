@@ -1,19 +1,13 @@
 import express from "express";
-import { createUser, getUsers, updateUser, deleteUser, loginUser, verifyToken } from "../controllers/UserController.js";
+// මෙන්න මෙතන ./ වෙනුවට ../ දාන්න
+import { createUser, loginUser, getUsers, updateUser, deleteUser, verifyToken } from "../controllers/userController.js";
 
-const UserRouter = express.Router();
+const router = express.Router();
 
-// ====================================================
-// Public Routes (No Token Required)
-// ====================================================
-UserRouter.post("/login", loginUser);
-UserRouter.post("/", createUser); // User Registration
+router.post("/login", loginUser);
+router.get("/", verifyToken, getUsers);
+router.post("/add", verifyToken, createUser);
+router.put("/:id", verifyToken, updateUser);
+router.delete("/:id", verifyToken, deleteUser);
 
-// ====================================================
-// Protected Routes (Token Required)
-// ====================================================
-UserRouter.get("/", verifyToken, getUsers);
-UserRouter.put("/:id", verifyToken, updateUser);
-UserRouter.delete("/:id", verifyToken, deleteUser);
-
-export default UserRouter;
+export default router;

@@ -4,18 +4,19 @@ import dotenv from "dotenv";
 
 import router from "./routers/UsersRouter.js";
 import ESP32DataRouter from "./routers/Esp32DataRouter.js";
-
+import UserRouter from "./routers/UsersRouter.js";
+import SuperuserRouter from "./routers/SuperuserRoutes.js";
 dotenv.config();
 
 const app = express();
 
-// CORS
-const allowedOrigins = ["http://localhost:3000", "http://localhost:3001", "https://flexicaredashbord.vercel.app"];
+const allowedOrigins = ["http://192.168.0.154:3001", "http://localhost:3001", "https://flexicaredashbord.vercel.app"];
 
 app.use(
   cors({
-    origin: [process.env.CLIENT_URL, "http://localhost:3000", "http://localhost:3001"],
+    origin: allowedOrigins,
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
+    credentials: true,
   }),
 );
 
@@ -32,8 +33,9 @@ app.get("/", (req, res) => {
 });
 
 // Routes
-app.use("/api/users", router);
+app.use("/api/users", UserRouter);
 app.use("/api/esp32", ESP32DataRouter);
+app.use("/api/superuser", SuperuserRouter);
 
 app.use((req, res) => {
   res.status(404).json({

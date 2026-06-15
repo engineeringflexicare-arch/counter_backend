@@ -37,14 +37,14 @@ export const getAllData = async (req, res) => {
 
 export const getAllLines = async (req, res) => {
   try {
-    console.log("👉 [DEBUG] GET /api/esp32/lines - Firebase එකෙන් දත්ත ගනිමින් පවතී...");
+    console.log("👉 [DEBUG] GET /api/esp32/lines - Firebase data loding...");
 
     const snapshot = await get(ref(rtdb, `Lines`));
 
-    console.log("👉 [DEBUG] දත්ත සාර්ථකව ලබාගත්තා!");
+    console.log("👉 [DEBUG feched data!");
     res.status(200).json({ success: true, data: snapshot.val() || {} });
   } catch (error) {
-    console.error("🔥 [DEBUG - FATAL ERROR] getAllLines හි දෝෂයක්:");
+    console.error("🔥 [DEBUG - FATAL ERROR] getAllLines in a error:");
     console.error(error);
     res.status(500).json({ success: false, message: error.message });
   }
@@ -193,7 +193,6 @@ export const updateLineDetails = async (req, res) => {
 // 4. Machine Data & Metrics Controllers
 // ==========================================
 
-// 👈 අලුතින් එකතු කළ function එක (Dashboard එකේ 404 Error එක විසඳීමට)
 export const getTotalOutput = async (req, res) => {
   try {
     const { machineId } = req.params;
