@@ -2,10 +2,11 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 
-import router from "./routers/UsersRouter.js";
 import ESP32DataRouter from "./routers/Esp32DataRouter.js";
-import UserRouter from "./routers/UsersRouter.js";
+
 import SuperuserRouter from "./routers/SuperuserRoutes.js";
+import router from "./routers/UsersRouter.js";
+
 dotenv.config();
 
 const app = express();
@@ -33,7 +34,7 @@ app.get("/", (req, res) => {
 });
 
 // Routes
-app.use("/api/users", UserRouter);
+app.use("/api/users", router);
 app.use("/api/esp32", ESP32DataRouter);
 app.use("/api/superuser", SuperuserRouter);
 
@@ -43,10 +44,10 @@ app.use((req, res) => {
     message: "Route not found",
   });
 });
+
 // Global Error Handler
 app.use((err, req, res, next) => {
   console.error("Server Error:", err);
-
   res.status(500).json({
     success: false,
     message: err.message || "Internal Server Error",
