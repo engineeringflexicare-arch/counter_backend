@@ -1,18 +1,84 @@
 import mongoose from "mongoose";
 
-const machineSchema = new mongoose.Schema(
+const counterSchema = new mongoose.Schema(
   {
-    machineId: { type: String, required: true, unique: true },
-    machineName: { type: String, default: "" },
-    status: { type: String, default: "offline" }, // "online" හෝ "offline"
-    machineState: { type: String, default: "idle" }, // "running" හෝ "idle"
-    productionStartTime: { type: String, default: "08:30" },
-    productionEndTime: { type: String, default: "20:30" },
-    dailyTarget: { type: Number, default: 0 },
+    counterId: {
+      type: String,
+      required: true,
+      unique: true,
+    },
+
+    counterName: {
+      type: String,
+      required: true,
+    },
+
+    // ESP32 Configuration
+    wifiSSID: {
+      type: String,
+      default: "",
+    },
+
+    wifiPassword: {
+      type: String,
+      default: "",
+    },
+
+    mqttBroker: {
+      type: String,
+      default: "",
+    },
+
+    mqttPort: {
+      type: Number,
+      default: 1883,
+    },
+
+    mqttTopic: {
+      type: String,
+      default: "",
+    },
+
+    firmwareVersion: {
+      type: String,
+      default: "1.0.0",
+    },
+
+    ipAddress: {
+      type: String,
+      default: "",
+    },
+
+    macAddress: {
+      type: String,
+      default: "",
+    },
+
+    // Device Status
+    status: {
+      type: String,
+      enum: ["Active", "Inactive", "Maintenance"],
+      default: "Active",
+    },
+
+    lastSeen: {
+      type: Date,
+      default: null,
+    },
+
+    isOnline: {
+      type: Boolean,
+      default: false,
+    },
+
+    notes: {
+      type: String,
+      default: "",
+    },
   },
   {
-    timestamps: true, // මෙය යෙදීමෙන් createdAt සහ updatedAt ස්වයංක්‍රීයව එකතු වේ
+    timestamps: true,
   },
 );
 
-export const Machine = mongoose.model("Machine", machineSchema);
+export const Counter = mongoose.model("Counter", counterSchema);

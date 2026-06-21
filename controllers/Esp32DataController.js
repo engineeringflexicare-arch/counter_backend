@@ -1,12 +1,14 @@
-import { ref, get, update } from "firebase/database";
+import { get, ref } from "firebase/database";
 import { rtdb } from "../database.js";
 import jwt from "jsonwebtoken";
+
+// 🔔 අලුත් Notifier එක Import කරගැනීම
+import { Notifier } from "../utils/Notifier.js";
 
 // ==========================================
 // 1. Helper Functions
 // ==========================================
 
-// Verify incoming JWT token
 const getAuthUser = (req) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
@@ -17,6 +19,109 @@ const getAuthUser = (req) => {
   } catch (err) {
     return null;
   }
+};
+
+const generateShiftHourBuckets = (startTime, endTime) => {
+  const [startHour, startMinute] = (startTime || "08:00").split(":").map(Number);
+  const [endHour, endMinute] = (endTime || "16:00").split(":").map(Number);
+
+  let startMinutes = startHour * 60 + startMinute;
+  let endMinutes = endHour * 60 + endMinute;
+
+  if (endMinutes <= startMinutes) {
+    endMinutes += 24 * 60;
+  }
+
+  const buckets = [];
+  let cursor = startMinutes;
+
+  while (cursor < endMinutes) {
+    const next = cursor + 60;
+    const fmt = (mins) => {
+      const wrapped = ((mins % 1440) + 1440) % 1440;
+      return `${String(Math.floor(wrapped / 60)).padStart(2, "0")}:${String(wrapped % 60).padStart(2, "0")}`;
+    };
+
+    buckets.push({
+      label: `${fmt(cursor)}-${fmt(next)}`,
+      startMinutes: cursor,
+      endMinutes: next,
+    });
+
+    cursor = next;
+  }
+
+  return buckets;
+};
+
+const timeToMinutesOfDay = (timeStr, dayOffsetMinutes = 0) => {
+  const timePart = timeStr.split(" ")[1];
+  const [h, m] = timePart.split(":").map(Number);
+  return h * 60 + m + dayOffsetMinutes;
+};
+
+const findBucketLabel = (buckets, minutesOfDay, shiftStartMinutes) => {
+  let adjusted = minutesOfDay;
+  if (adjusted < shiftStartMinutes) {
+    adjusted += 24 * 60;
+  }
+
+  const bucket = buckets.find((b) => adjusted >= b.startMinutes && adjusted < b.endMinutes);
+  return bucket ? bucket.label : null;
+};
+
+const MIN_READINGS_PER_RUN = 2;
+
+const splitIntoRuns = (history) => {
+  const rawRuns = [];
+  let currentRun = [];
+
+  for (let i = 0; i < history.length; i++) {
+    const current = history[i];
+    const previous = history[i - 1];
+
+    if (previous && Number(current.Count) < Number(previous.Count)) {
+      if (currentRun.length > 0) rawRuns.push(currentRun);
+      currentRun = [];
+    }
+
+    currentRun.push(current);
+  }
+
+  if (currentRun.length > 0) rawRuns.push(currentRun);
+  return rawRuns.filter((run) => run.length >= MIN_READINGS_PER_RUN);
+};
+
+const getRunOutput = (run) => {
+  const counts = run.map((item) => Number(item.Count));
+  return Math.max(...counts) - Math.min(...counts);
+};
+
+const getRunHourlyData = (run, buckets, shiftStartMinutes) => {
+  const outputs = {};
+  buckets.forEach((b) => {
+    outputs[b.label] = 0;
+  });
+
+  for (let i = 1; i < run.length; i++) {
+    const item = run[i];
+    const prevItem = run[i - 1];
+
+    const currentCount = Number(item.Count);
+    const previousCount = Number(prevItem.Count);
+    const delta = currentCount - previousCount;
+
+    if (delta <= 0) continue;
+
+    const minutesOfDay = timeToMinutesOfDay(item.Time);
+    const label = findBucketLabel(buckets, minutesOfDay, shiftStartMinutes);
+
+    if (label && outputs[label] !== undefined) {
+      outputs[label] += delta;
+    }
+  }
+
+  return buckets.map((b) => ({ hour: b.label, output: outputs[b.label] || 0 }));
 };
 
 // ==========================================
@@ -31,161 +136,8 @@ export const getAllData = async (req, res) => {
     }
     res.status(200).json({ success: true, data: snapshot.val() });
   } catch (error) {
+    Notifier.toAdmin("Firebase Error", `Failed to get All Data: ${error.message}`, "CRITICAL_ERROR");
     res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-export const getAllLines = async (req, res) => {
-  try {
-    console.log("👉 [DEBUG] GET /api/esp32/lines - Firebase data loding...");
-
-    const snapshot = await get(ref(rtdb, `Lines`));
-
-    console.log("👉 [DEBUG feched data!");
-    res.status(200).json({ success: true, data: snapshot.val() || {} });
-  } catch (error) {
-    console.error("🔥 [DEBUG - FATAL ERROR] getAllLines in a error:");
-    console.error(error);
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-export const getLineById = async (req, res) => {
-  try {
-    const { lineId } = req.params;
-    const snapshot = await get(ref(rtdb, `Lines/${lineId}`));
-
-    if (!snapshot.exists()) {
-      return res.status(404).json({ success: false, message: "Line not found" });
-    }
-
-    return res.status(200).json({ success: true, data: snapshot.val() });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-// ==========================================
-// 3. Line Management Controllers
-// ==========================================
-
-export const assignLine = async (req, res) => {
-  const { lineId, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, supervisor, shiftStartTime, shiftEndTime, floor } = req.body;
-
-  if (!lineId) {
-    return res.status(400).json({ success: false, message: "Line ID is required" });
-  }
-
-  try {
-    const lineRef = ref(rtdb, `Lines/${lineId}`);
-    await update(lineRef, {
-      machineId: machineId || "",
-      productCode: productCode || "",
-      dailyTarget: Number(dailyTarget) || 0,
-      hourlyTarget: Number(hourlyTarget) || 0,
-      plannedMembers: Number(teamMembers) || 0,
-      shift: shift || "",
-      supervisor: supervisor || "",
-      shiftStartTime: shiftStartTime || "",
-      shiftEndTime: shiftEndTime || "",
-      floor: floor || "",
-      assignedAt: new Date().toISOString(),
-    });
-
-    return res.status(200).json({ success: true, message: "Line assigned successfully" });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-export const removeAssignment = async (req, res) => {
-  const user = getAuthUser(req);
-
-  if (!user || (user.role !== "Admin" && user.role !== "Superuser")) {
-    return res.status(403).json({
-      success: false,
-      message: "Access Denied: Only Admins and Superusers can remove line assignments.",
-    });
-  }
-
-  const { lineId } = req.body;
-  if (!lineId) {
-    return res.status(400).json({ success: false, message: "Line ID is required." });
-  }
-
-  try {
-    const lineRef = ref(rtdb, `Lines/${lineId}`);
-    await update(lineRef, {
-      machineId: "",
-      productCode: "",
-      dailyTarget: 0,
-      hourlyTarget: 0,
-      plannedMembers: 0,
-      totalProductCount: 0,
-      shift: "",
-      supervisor: "",
-      shiftStartTime: "",
-      shiftEndTime: "",
-      floor: "",
-      assignedBy: "",
-      assignedAt: "",
-    });
-
-    return res.status(200).json({ success: true, message: `Assignment for ${lineId} removed successfully.` });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: "Failed to remove assignment." });
-  }
-};
-
-export const updateLineDetails = async (req, res) => {
-  const user = getAuthUser(req);
-  const allowedRoles = ["Admin", "Superuser", "Supervisor"];
-
-  if (!user || !allowedRoles.includes(user.role)) {
-    return res.status(403).json({
-      success: false,
-      message: "Access Denied: Only Admins, Superusers, and Supervisors can update line details.",
-    });
-  }
-
-  const { lineId, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, floor } = req.body;
-
-  if (!lineId) {
-    return res.status(400).json({ success: false, message: "Line ID is required." });
-  }
-
-  try {
-    const lineRef = ref(rtdb, `Lines/${lineId}`);
-    const snapshot = await get(lineRef);
-
-    if (!snapshot.exists()) {
-      return res.status(404).json({ success: false, message: "Line not found." });
-    }
-
-    const currentLineData = snapshot.val();
-
-    if (user.role === "Supervisor" && currentLineData.supervisor !== user.name) {
-      return res.status(403).json({
-        success: false,
-        message: "Access Denied: You can only update details of lines assigned to you.",
-      });
-    }
-
-    await update(lineRef, {
-      machineId: machineId !== undefined ? machineId : currentLineData.machineId,
-      productCode: productCode !== undefined ? productCode : currentLineData.productCode,
-      dailyTarget: dailyTarget !== undefined ? Number(dailyTarget) : currentLineData.dailyTarget,
-      hourlyTarget: hourlyTarget !== undefined ? Number(hourlyTarget) : currentLineData.hourlyTarget,
-      plannedMembers: teamMembers !== undefined ? Number(teamMembers) : currentLineData.plannedMembers,
-      shift: shift !== undefined ? shift : currentLineData.shift,
-      floor: floor !== undefined ? floor : currentLineData.floor,
-      updatedBy: user.name,
-      updatedAt: new Date().toISOString(),
-    });
-
-    return res.status(200).json({ success: true, message: `Line ${lineId} details updated successfully.` });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: "Failed to update line details." });
   }
 };
 
@@ -202,6 +154,7 @@ export const getTotalOutput = async (req, res) => {
 
     return res.status(200).json({ success: true, totalOutput: count });
   } catch (error) {
+    Notifier.toAdmin("Firebase Error", `Failed to fetch Total Output for ${req.params?.machineId}: ${error.message}`, "IOT_ERROR");
     return res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -217,16 +170,7 @@ export const getMachineData = async (req, res) => {
     }
     res.status(200).json({ success: true, data: machineData });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-};
-
-export const getMachineStatus = async (req, res) => {
-  try {
-    const { machineId } = req.params;
-    const snapshot = await get(ref(rtdb, `Machine_01/LiveStatus`));
-    res.status(200).json({ success: true, data: snapshot.val() });
-  } catch (error) {
+    Notifier.toAdmin("Firebase Error", `Failed to fetch Machine Data [${machineId}]: ${error.message}`, "IOT_ERROR");
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -237,6 +181,7 @@ export const getCounterHistory = async (req, res) => {
     const snapshot = await get(ref(rtdb, `${machineId}/CounterHistory`));
     res.status(200).json({ success: true, data: snapshot.val() });
   } catch (error) {
+    Notifier.toAdmin("Firebase Error", `Counter History Fetch Error: ${error.message}`, "IOT_ERROR");
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -263,6 +208,7 @@ export const getMachineLiveMetrics = async (req, res) => {
       },
     });
   } catch (error) {
+    Notifier.toAdmin("Firebase Error", `Live Metrics Fetch Error [${req.params?.machineId}]: ${error.message}`, "IOT_ERROR");
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -310,6 +256,7 @@ export const getHourlyTableData = async (req, res) => {
       hourlyData,
     });
   } catch (error) {
+    Notifier.toAdmin("Firebase Error", `Hourly Table Data Error [${machineId}]: ${error.message}`, "CRITICAL_ERROR");
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -340,122 +287,11 @@ export const getFreeCounterMachines = async (req, res) => {
 
     return res.status(200).json({ success: true, count: freeMachines.length, data: freeMachines });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    console.error("Error fetching free counters:", error);
+    Notifier.toAdmin("Firebase Error", `Free Counters Fetch Error: ${error.message}`, "CRITICAL_ERROR");
+    res.status(500).json({ success: false, message: "Server Error" });
   }
 };
-
-// ==========================================
-// 5. Refactored / Combined Controllers
-// ==========================================
-
-export async function getHourlyProductionData(req, res) {
-  const { machineId } = req.params;
-  const { date } = req.query;
-
-  const hours = [
-    "08:00-09:00",
-    "09:00-10:00",
-    "10:00-11:00",
-    "11:00-12:00",
-    "12:00-13:00",
-    "13:00-14:00",
-    "14:00-15:00",
-    "15:00-16:00",
-    "16:00-17:00",
-    "17:00-18:00",
-    "18:00-19:00",
-    "19:00-20:00",
-    "20:00-21:00",
-    "21:00-22:00",
-    "22:00-23:00",
-    "23:00-00:00",
-    "00:00-01:00",
-    "01:00-02:00",
-    "02:00-03:00",
-    "03:00-04:00",
-    "04:00-05:00",
-    "05:00-06:00",
-    "06:00-07:00",
-    "07:00-08:00",
-  ];
-
-  try {
-    const snapshot = await get(ref(rtdb, `Machines/${machineId}/CounterHistory`));
-
-    const selectedDate =
-      date ||
-      (() => {
-        const now = new Date();
-        return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-      })();
-
-    if (!snapshot.exists()) {
-      return res.status(200).json({
-        success: true,
-        machineId,
-        date: selectedDate,
-        totalOutput: 0,
-        currentHour: "N/A",
-        currentHourOutput: 0,
-        hourlyData: hours.map((hour) => ({ hour, output: 0 })),
-      });
-    }
-
-    const history = Object.values(snapshot.val())
-      .filter((item) => {
-        if (!item.Time) return false;
-        const itemDate = item.Time.split(" ")[0].replace(/\//g, "-");
-        return itemDate === selectedDate;
-      })
-      .sort((a, b) => a.Time.localeCompare(b.Time));
-
-    const lastCountsByHour = {};
-    history.forEach((item) => {
-      const timePart = item.Time.split(" ")[1];
-      const hourStr = timePart.split(":")[0];
-      lastCountsByHour[hourStr] = Number(item.Count || 0);
-    });
-
-    const chronologicalOutputs = {};
-    let previousLastCount = 0;
-
-    for (let i = 0; i < 24; i++) {
-      const hourStr = String(i).padStart(2, "0");
-      const nextHourStr = String((i + 1) % 24).padStart(2, "0");
-      const range = `${hourStr}:00-${nextHourStr}:00`;
-
-      if (lastCountsByHour[hourStr] !== undefined) {
-        const currentLastCount = lastCountsByHour[hourStr];
-        chronologicalOutputs[range] = currentLastCount >= previousLastCount ? currentLastCount - previousLastCount : currentLastCount;
-        previousLastCount = currentLastCount;
-      } else {
-        chronologicalOutputs[range] = 0;
-      }
-    }
-
-    const hourlyData = hours.map((range) => ({
-      hour: range,
-      output: chronologicalOutputs[range] || 0,
-    }));
-
-    const totalOutput = hourlyData.reduce((sum, item) => sum + item.output, 0);
-    const currentHourNum = new Date().getHours();
-    const currentRange = `${String(currentHourNum).padStart(2, "0")}:00-${String((currentHourNum + 1) % 24).padStart(2, "0")}:00`;
-    const currentHourOutput = hourlyData.find((item) => item.hour === currentRange)?.output || 0;
-
-    return res.status(200).json({
-      success: true,
-      machineId,
-      date: selectedDate,
-      totalOutput,
-      currentHour: currentRange,
-      currentHourOutput,
-      hourlyData,
-    });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-}
 
 export async function getCombinedProductionGaps(req, res) {
   const { date, lineId, machineId: queryMachineId } = req.query;
@@ -558,6 +394,7 @@ export async function getCombinedProductionGaps(req, res) {
       data: gapData,
     });
   } catch (error) {
+    Notifier.toAdmin("Firebase Error", `Production Gaps Calc Error: ${error.message}`, "CRITICAL_ERROR");
     return res.status(500).json({ success: false, message: error.message });
   }
 }
@@ -594,6 +431,185 @@ export const getLiveDataByLineId = async (req, res) => {
       machineId,
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    console.error("Error fetching free counters:", error);
+    Notifier.toAdmin("Firebase Error", `Live Data Error [${req.params?.lineId}]: ${error.message}`, "IOT_ERROR");
+    res.status(500).json({ success: false, message: "Server Error" });
   }
 };
+
+// ==========================================
+// Phase 2: Machine Health Status
+// ==========================================
+
+export const getMachineStatus = async (req, res) => {
+  try {
+    const machinesRef = ref(rtdb, "Machines");
+    const snapshot = await get(machinesRef);
+
+    if (!snapshot.exists()) {
+      return res.status(200).json({ success: true, data: [] });
+    }
+
+    const machines = snapshot.val();
+    const statusData = [];
+
+    for (const [machineId, machineData] of Object.entries(machines)) {
+      if (machineData.Health) {
+        statusData.push({
+          machineId,
+          ...machineData.Health,
+        });
+      }
+    }
+
+    return res.status(200).json({ success: true, data: statusData });
+  } catch (error) {
+    console.error("Error fetching machine status:", error);
+    Notifier.toAdmin("Firebase Error", `Machine Health Status Error: ${error.message}`, "IOT_ERROR");
+    return res.status(500).json({ success: false, message: "Server Error" });
+  }
+};
+
+const generateShiftSlots = (dateStr, startTimeStr, endTimeStr) => {
+  const [year, month, day] = dateStr.split("-").map(Number);
+  const [startH, startM] = startTimeStr.split(":").map(Number);
+  const [endH, endM] = endTimeStr.split(":").map(Number);
+
+  const start = new Date(year, month - 1, day, startH, startM, 0);
+  const end = new Date(year, month - 1, day, endH, endM, 0);
+
+  if (end <= start) {
+    end.setDate(end.getDate() + 1);
+  }
+
+  const slots = [];
+  let current = new Date(start);
+
+  const formatTime = (d) => `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+
+  while (current < end) {
+    const next = new Date(current);
+    next.setHours(next.getHours() + 1);
+
+    slots.push({
+      label: `${formatTime(current)}-${formatTime(next)}`,
+      startTimestamp: Math.floor(current.getTime() / 1000),
+      endTimestamp: Math.floor(next.getTime() / 1000),
+    });
+
+    current.setHours(current.getHours() + 1);
+  }
+
+  return {
+    shiftSlots: slots,
+    shiftStartTs: Math.floor(start.getTime() / 1000),
+    shiftEndTs: Math.floor(end.getTime() / 1000),
+  };
+};
+
+export async function getHourlyProductionData(req, res) {
+  const { machineId } = req.params;
+  const { date, shiftStartTime, shiftEndTime } = req.query;
+
+  const startTime = shiftStartTime || "08:00";
+  const endTime = shiftEndTime || "16:00";
+  const dayBuckets = generateShiftHourBuckets(startTime, endTime);
+
+  const [startH, startM] = startTime.split(":").map(Number);
+  const dayStartMinutes = startH * 60 + startM;
+
+  const hours = dayBuckets.map((b) => b.label);
+
+  try {
+    const snapshot = await get(ref(rtdb, `Machines/${machineId}/CounterHistory`));
+
+    const selectedDate =
+      date ||
+      (() => {
+        const now = new Date();
+        return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+      })();
+
+    if (!snapshot.exists()) {
+      return res.status(200).json({
+        success: true,
+        machineId,
+        date: selectedDate,
+        totalOutput: 0,
+        currentHour: "N/A",
+        currentHourOutput: 0,
+        hourlyData: hours.map((hour) => ({ hour, output: 0 })),
+        runCount: 0,
+        runs: [],
+      });
+    }
+
+    const history = Object.values(snapshot.val())
+      .filter((item) => {
+        if (!item.Time) return false;
+        const itemDate = item.Time.split(" ")[0].replace(/\//g, "-");
+        return itemDate === selectedDate;
+      })
+      .sort((a, b) => a.Time.localeCompare(b.Time));
+
+    const runs = splitIntoRuns(history);
+
+    const chronologicalOutputs = {};
+    hours.forEach((range) => {
+      chronologicalOutputs[range] = 0;
+    });
+
+    runs.forEach((run) => {
+      for (let i = 1; i < run.length; i++) {
+        const item = run[i];
+        const prevItem = run[i - 1];
+
+        const currentCount = Number(item.Count);
+        const previousCount = Number(prevItem.Count);
+        const delta = currentCount - previousCount;
+
+        if (delta <= 0) continue;
+
+        const minutesOfDay = timeToMinutesOfDay(item.Time);
+        const range = findBucketLabel(dayBuckets, minutesOfDay, dayStartMinutes);
+
+        if (range && chronologicalOutputs[range] !== undefined) {
+          chronologicalOutputs[range] += delta;
+        }
+      }
+    });
+
+    const hourlyData = hours.map((range) => ({
+      hour: range,
+      output: chronologicalOutputs[range] || 0,
+    }));
+
+    const totalOutput = runs.reduce((sum, run) => sum + getRunOutput(run), 0);
+
+    const now = new Date();
+    const nowMinutesOfDay = now.getHours() * 60 + now.getMinutes();
+    const currentRange = findBucketLabel(dayBuckets, nowMinutesOfDay, dayStartMinutes) || "N/A";
+    const currentHourOutput = hourlyData.find((item) => item.hour === currentRange)?.output || 0;
+
+    return res.status(200).json({
+      success: true,
+      machineId,
+      date: selectedDate,
+      totalOutput,
+      currentHour: currentRange,
+      currentHourOutput,
+      hourlyData,
+      runCount: runs.length,
+      runs: runs.map((run, index) => ({
+        runNo: index + 1,
+        startTime: run[0]?.Time,
+        endTime: run[run.length - 1]?.Time,
+        totalOutput: getRunOutput(run),
+        hourlyData: getRunHourlyData(run, dayBuckets, dayStartMinutes),
+      })),
+    });
+  } catch (error) {
+    Notifier.toAdmin("Firebase Error", `Hourly Production Data Error: ${error.message}`, "CRITICAL_ERROR");
+    return res.status(500).json({ success: false, message: error.message });
+  }
+}

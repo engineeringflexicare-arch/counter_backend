@@ -1,27 +1,89 @@
-import { ref, get, update, push } from "firebase/database";
+import { get, ref } from "firebase/database";
 import { rtdb } from "../database.js";
-import jwt from "jsonwebtoken";
+import { Line } from "../models/Line.js";
+import { LineHistory } from "../models/LineHistory.js";
+import { AuditLog } from "../models/AuditLog.js";
+import { Notification } from "../models/Notification.js";
+import Configuration from "../models/Configuration.js";
+import { Notifier } from "../utils/Notifier.js";
 
-const getAuthUser = (req) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
-  const token = authHeader.split(" ")[1];
+// ============================================================================
+// Permission Helper (Admin ට සහ Superuser ට පමණක් වෙනස්කම් කිරීමට ඉඩ දීම)
+// ============================================================================
+const canEdit = (req, res) => {
+  const allowedRoles = ["Admin", "Superuser"];
+  if (req.user && allowedRoles.includes(req.user.role)) return true;
+
+  res.status(403).json({
+    success: false,
+    message: "Access denied. Requires Admin or Superuser privileges.",
+  });
+  return false;
+};
+
+// ============================================================================
+// 1. GET ALL LINES (පවතින සියලුම Lines ලබා ගැනීම)
+// ============================================================================
+export const getAllLines = async (req, res) => {
   try {
-    return jwt.verify(token, process.env.JWT_SECRET);
-  } catch (err) {
-    return null;
+    const lines = await Line.find().sort({ lineId: 1 });
+    return res.status(200).json({ success: true, count: lines.length, data: lines });
+  } catch (error) {
+    Notifier.toAdmin("System Error", `Get All Lines Error: ${error.message}`, "CRITICAL_ERROR");
+    return res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// 1. Assign Line
+// ============================================================================
+// 2. GET SINGLE LINE (නිශ්චිත Line එකක විස්තර පමණක් ලබා ගැනීම)
+// ============================================================================
+export const getLineById = async (req, res) => {
+  try {
+    const { lineId } = req.params;
+    // Note: ensure your route parameter matches this (e.g., /:lineId)
+    const line = await Line.findOne({ lineId: lineId });
+
+    if (!line) return res.status(404).json({ success: false, message: "Line not found" });
+    return res.status(200).json({ success: true, data: line });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ============================================================================
+// 3. GET AVAILABLE MACHINES
+// ============================================================================
+export const getAvailableMachines = async (req, res) => {
+  try {
+    const configs = await Configuration.find();
+    const assignedLines = await Line.find();
+    const assignedMachines = assignedLines.map((line) => line.machineId).filter(Boolean);
+
+    const machines = configs.filter((config) => !assignedMachines.includes(config.device_id)).map((config) => ({ machineId: config.device_id }));
+
+    return res.status(200).json({ success: true, data: machines });
+  } catch (error) {
+    console.error("GET MACHINES ERROR:", error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ============================================================================
+// 4. ASSIGN LINE (Line එකකට Machine එකක් හා ඉලක්කයන් සවි කිරීම)
+// ============================================================================
 export const assignLine = async (req, res) => {
-  const { lineId, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, supervisor, shiftStartTime, shiftEndTime, floor } = req.body;
-  if (!lineId) return res.status(400).json({ success: false, message: "Line ID is required" });
+  if (!canEdit(req, res)) return;
 
   try {
-    const lineRef = ref(rtdb, `Lines/${lineId}`);
-    await update(lineRef, {
-      machineId: machineId || "",
+    const { lineId, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, supervisor, shiftStartTime, shiftEndTime, floor } = req.body;
+    const userName = req.user?.name || "System";
+
+    if (!lineId || !machineId) {
+      return res.status(400).json({ success: false, message: "Line ID and Machine ID are required" });
+    }
+
+    const updateData = {
+      machineId,
       productCode: productCode || "",
       dailyTarget: Number(dailyTarget) || 0,
       hourlyTarget: Number(hourlyTarget) || 0,
@@ -31,35 +93,62 @@ export const assignLine = async (req, res) => {
       shiftStartTime: shiftStartTime || "",
       shiftEndTime: shiftEndTime || "",
       floor: floor || "",
-      assignedAt: new Date().toISOString(),
+      assignedBy: userName,
+      updatedBy: userName,
+    };
+
+    let line = await Line.findOne({ lineId });
+    let oldData = null;
+    let action = "LINE_ASSIGNED";
+
+    if (line) {
+      oldData = line.toObject();
+      Object.assign(line, updateData);
+      action = "LINE_REASSIGNED";
+    } else {
+      line = new Line({ lineId, ...updateData });
+    }
+
+    await line.save();
+
+    await AuditLog.create({
+      action,
+      entity: "Line",
+      entityId: lineId,
+      oldData,
+      newData: updateData,
+      changedBy: userName,
     });
 
-    // Alert for Assignment
-    await push(ref(rtdb, `Alerts`), {
-      type: "info",
-      message: `Line ${lineId} has been assigned to ${supervisor}.`,
-      timestamp: new Date().toISOString(),
-    });
+    // 🔔 Dispatching Notifications
+    Notifier.toSuperuser("Line Assignment", `Line ${lineId} assigned to Machine ${machineId}`, "LINE_UPDATE", userName);
+    Notifier.toSupervisor("New Line Assigned", `Machine ${machineId} is now assigned to Line ${lineId}`, "LINE_UPDATE", userName);
 
-    return res.status(200).json({ success: true, message: "Line assigned successfully" });
+    return res.status(200).json({ success: true, message: "Line assigned successfully", data: line });
   } catch (error) {
+    console.error("ASSIGN LINE ERROR:", error);
+    Notifier.toAdmin("System Error", `Assign Line Error [${req.body?.lineId}]: ${error.message}`, "CRITICAL_ERROR", req.user?.name);
     return res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// 2. Remove Assignment
+// ============================================================================
+// 5. REMOVE ASSIGNMENT (Line එකකින් Machine එකක් ඉවත් කිරීම)
+// ============================================================================
 export const removeAssignment = async (req, res) => {
-  const user = getAuthUser(req);
-  if (!user || (user.role !== "Admin" && user.role !== "Superuser")) {
-    return res.status(403).json({ success: false, message: "Access Denied: Only Admins/Superusers." });
-  }
-
-  const { lineId } = req.body;
-  if (!lineId) return res.status(400).json({ success: false, message: "Line ID is required." });
+  if (!canEdit(req, res)) return;
 
   try {
-    const lineRef = ref(rtdb, `Lines/${lineId}`);
-    await update(lineRef, {
+    const { lineId } = req.body;
+    if (!lineId) return res.status(400).json({ success: false, message: "Line ID required" });
+
+    const line = await Line.findOne({ lineId });
+    if (!line) return res.status(404).json({ success: false, message: "Line not found" });
+
+    const oldData = line.toObject();
+    const oldMachineId = line.machineId;
+
+    Object.assign(line, {
       machineId: "",
       productCode: "",
       dailyTarget: 0,
@@ -71,63 +160,231 @@ export const removeAssignment = async (req, res) => {
       shiftStartTime: "",
       shiftEndTime: "",
       floor: "",
-      assignedBy: "",
-      assignedAt: "",
     });
 
-    await push(ref(rtdb, `Alerts`), {
-      type: "warning",
-      message: `Assignment for ${lineId} has been removed by ${user.name}.`,
-      timestamp: new Date().toISOString(),
+    await line.save();
+
+    await AuditLog.create({
+      action: "LINE_CLEARED",
+      entity: "Line",
+      entityId: lineId,
+      oldData,
+      newData: line,
+      changedBy: req.user?.name || "System",
     });
 
-    return res.status(200).json({ success: true, message: `Assignment for ${lineId} removed successfully.` });
+    Notifier.toSuperuser("Assignment Cleared", `Machine ${oldMachineId} removed from Line ${lineId}`, "LINE_UPDATE", req.user?.name);
+    Notifier.toSupervisor("Assignment Cleared", `Line ${lineId} is now unassigned`, "LINE_UPDATE", req.user?.name);
+
+    return res.status(200).json({ success: true, message: "Assignment removed successfully" });
   } catch (error) {
-    return res.status(500).json({ success: false, message: "Failed to remove assignment." });
+    Notifier.toAdmin("System Error", `Remove Assignment Error: ${error.message}`, "CRITICAL_ERROR", req.user?.name);
+    return res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// 3. Update Line Details
+// ============================================================================
+// 6. UPDATE LINE DETAILS (Line එකක දත්ත පමණක් සංස්කරණය කිරීම)
+// ============================================================================
 export const updateLineDetails = async (req, res) => {
-  const user = getAuthUser(req);
-  const allowedRoles = ["Admin", "Superuser", "Supervisor"];
-
-  if (!user || !allowedRoles.includes(user.role)) {
-    return res.status(403).json({ success: false, message: "Access Denied." });
-  }
-
-  const { lineId, date, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, floor } = req.body;
-  if (!lineId) return res.status(400).json({ success: false, message: "Line ID required." });
+  if (!canEdit(req, res)) return;
 
   try {
-    const lineRef = ref(rtdb, `Lines/${lineId}`);
-    const snapshot = await get(lineRef);
-    if (!snapshot.exists()) return res.status(404).json({ success: false, message: "Line not found." });
+    const { lineId, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, floor, supervisor, plannedDate, shiftStartTime, shiftEndTime } = req.body;
 
-    const currentLineData = snapshot.val();
+    const line = await Line.findOne({ lineId });
+    if (!line) return res.status(404).json({ success: false, message: "Line not found" });
 
-    await update(lineRef, {
-      machineId: machineId !== undefined ? machineId : currentLineData.machineId,
-      productCode: productCode !== undefined ? productCode : currentLineData.productCode,
-      dailyTarget: dailyTarget !== undefined ? Number(dailyTarget) : currentLineData.dailyTarget,
-      hourlyTarget: hourlyTarget !== undefined ? Number(hourlyTarget) : currentLineData.hourlyTarget,
-      plannedMembers: teamMembers !== undefined ? Number(teamMembers) : currentLineData.plannedMembers,
-      shift: shift !== undefined ? shift : currentLineData.shift,
-      floor: floor !== undefined ? floor : currentLineData.floor,
-      plannedDate: date || currentLineData.plannedDate || new Date().toISOString().split("T")[0],
-      updatedBy: user.name,
-      updatedAt: new Date().toISOString(),
+    const oldData = line.toObject();
+
+    Object.assign(line, {
+      machineId: machineId ?? line.machineId,
+      productCode: productCode ?? line.productCode,
+      dailyTarget: dailyTarget ?? line.dailyTarget,
+      hourlyTarget: hourlyTarget ?? line.hourlyTarget,
+      plannedMembers: teamMembers ?? line.plannedMembers,
+      shift: shift ?? line.shift,
+      floor: floor ?? line.floor,
+      supervisor: supervisor ?? line.supervisor,
+      plannedDate: plannedDate ?? line.plannedDate,
+      shiftStartTime: shiftStartTime ?? line.shiftStartTime,
+      shiftEndTime: shiftEndTime ?? line.shiftEndTime,
     });
 
-    // Alert for Update
-    await push(ref(rtdb, `Alerts`), {
-      type: "info",
-      message: `Line ${lineId} was updated by ${user.name}.`,
-      timestamp: new Date().toISOString(),
+    await line.save();
+
+    const historyDate = plannedDate || new Date().toISOString().split("T")[0];
+
+    // Safe Mongoose object stripping for History saving
+    const lineObj = line.toObject();
+    delete lineObj._id;
+    delete lineObj.__v;
+
+    if (LineHistory) {
+      await LineHistory.findOneAndUpdate({ lineId, historyDate }, { ...lineObj, historyDate }, { upsert: true, new: true });
+    }
+
+    await AuditLog.create({
+      action: "LINE_UPDATE",
+      entity: "Line",
+      entityId: lineId,
+      oldData,
+      newData: lineObj,
+      changedBy: req.user?.name || "System",
     });
 
-    return res.status(200).json({ success: true, message: "Line updated successfully." });
+    Notifier.toSuperuser("Line Updated", `Details for Line ${lineId} were updated`, "LINE_UPDATE", req.user?.name);
+    Notifier.toSupervisor("Line Updated", `Line ${lineId} production targets updated`, "LINE_UPDATE", req.user?.name);
+
+    return res.status(200).json({ success: true, message: "Line updated successfully" });
   } catch (error) {
+    console.error("UPDATE LINE ERROR:", error);
+    Notifier.toAdmin("System Error", `Update Line Error [${req.body?.lineId}]: ${error.message}`, "CRITICAL_ERROR", req.user?.name);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// ============================================================================
+// 7. GET LIVE DATA BY LINE ID (Firebase හරහා තථ්‍ය කාලීන දත්ත කියවීම)
+// ============================================================================
+export const getLiveDataByLineId = async (req, res) => {
+  try {
+    const { lineId } = req.params;
+    const lineSnapshot = await get(ref(rtdb, `Lines/${lineId}`));
+
+    if (!lineSnapshot.exists()) {
+      return res.status(404).json({ success: false, message: "Line not found in live database" });
+    }
+
+    const lineData = lineSnapshot.val();
+    const machineId = lineData.machineId;
+
+    if (!machineId) {
+      return res.status(404).json({ success: false, message: "No machine assigned to this line" });
+    }
+
+    const statusSnapshot = await get(ref(rtdb, `Machines/${machineId}/LiveStatus/Count`));
+    const count = statusSnapshot.exists() ? statusSnapshot.val() : 0;
+
+    return res.status(200).json({
+      success: true,
+      count,
+      target: lineData.dailyTarget || 0,
+      productCode: lineData.productCode || "—",
+      startTime: lineData.shiftStartTime || "—",
+      machineId,
+    });
+  } catch (error) {
+    Notifier.toAdmin("System Error", `Live Data Fetch Error [${req.params?.lineId}]: ${error.message}`, "IOT_ERROR");
+    return res.status(500).json({ success: false, message: "Server Error" });
+  }
+};
+
+// ============================================================================
+// 8. GET COMBINED PRODUCTION GAPS (නිෂ්පාදන ප්‍රමාදයන්/Gaps ගණනය කිරීම)
+// ============================================================================
+export const getCombinedProductionGaps = async (req, res) => {
+  const { date, lineId, machineId: queryMachineId } = req.query;
+  let targetMachineId = queryMachineId;
+  let lineData = {};
+
+  try {
+    if (lineId) {
+      const lineSnapshot = await get(ref(rtdb, `Lines/${lineId}`));
+      if (!lineSnapshot.exists()) {
+        return res.status(404).json({ success: false, message: "Line not found" });
+      }
+      lineData = lineSnapshot.val();
+      targetMachineId = lineData.machineId;
+
+      if (!targetMachineId) {
+        return res.status(404).json({ success: false, message: "No machine assigned to this line" });
+      }
+    }
+
+    if (!targetMachineId) {
+      return res.status(400).json({ success: false, message: "Please provide either lineId or machineId" });
+    }
+
+    const historySnapshot = await get(ref(rtdb, `Machines/${targetMachineId}/CounterHistory`));
+
+    if (!historySnapshot.exists()) {
+      return res.status(404).json({ success: false, message: "No CounterHistory found" });
+    }
+
+    const machineSnapshot = await get(ref(rtdb, `Machines/${targetMachineId}`));
+    const machineData = machineSnapshot.val() || {};
+
+    const startTime = lineData.shiftStartTime || machineData.productionStartTime || "08:30";
+    const endTime = lineData.shiftEndTime || machineData.productionEndTime || "20:30";
+    const dailyTarget = Number(lineData.dailyTarget || machineData.dailyTarget || 0);
+
+    const selectedDate =
+      date ||
+      (() => {
+        const now = new Date();
+        return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+      })();
+
+    const history = Object.values(historySnapshot.val())
+      .filter((item) => {
+        if (!item.Time) return false;
+        const itemDate = item.Time.split(" ")[0].replace(/\//g, "-");
+        return itemDate === selectedDate;
+      })
+      .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+    const gapData = [];
+
+    for (let i = 1; i < history.length; i++) {
+      const current = history[i];
+      const previous = history[i - 1];
+
+      if (current.Count > previous.Count) {
+        let gapSeconds = 0;
+        if (current.timestamp && previous.timestamp) {
+          gapSeconds = current.timestamp - previous.timestamp;
+        } else {
+          const currTime = new Date(current.Time.replace(/\//g, "-")).getTime() / 1000;
+          const prevTime = new Date(previous.Time.replace(/\//g, "-")).getTime() / 1000;
+          gapSeconds = currTime - prevTime;
+        }
+
+        if (gapSeconds >= 0) {
+          gapData.push({
+            count: current.Count,
+            time: current.Time.split(" ")[1],
+            gapSeconds: Math.round(gapSeconds),
+          });
+        }
+      }
+    }
+
+    let plannedAverageGap = 0;
+    if (dailyTarget > 0) {
+      const [sh, sm] = startTime.split(":").map(Number);
+      const [eh, em] = endTime.split(":").map(Number);
+      const startSeconds = sh * 3600 + sm * 60;
+      const endSeconds = eh * 3600 + em * 60;
+      let workingSeconds = endSeconds - startSeconds;
+
+      if (workingSeconds < 0) workingSeconds += 24 * 3600;
+      plannedAverageGap = Number((workingSeconds / dailyTarget).toFixed(2));
+    }
+
+    return res.status(200).json({
+      success: true,
+      lineId: lineId || null,
+      machineId: targetMachineId,
+      date: selectedDate,
+      startTime,
+      endTime,
+      dailyTarget,
+      averageGap: plannedAverageGap,
+      data: gapData,
+    });
+  } catch (error) {
+    Notifier.toAdmin("System Error", `Production Gaps Calc Error: ${error.message}`, "CRITICAL_ERROR");
     return res.status(500).json({ success: false, message: error.message });
   }
 };

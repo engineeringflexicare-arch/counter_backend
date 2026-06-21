@@ -1,11 +1,7 @@
 import express from "express";
-
-// පරණ Controller එකෙන් ගන්න දේවල්
 import {
   getAllData,
   getCounterHistory,
-  getAllLines,
-  getLineById,
   getHourlyProductionData,
   getCombinedProductionGaps,
   getMachineData,
@@ -13,47 +9,41 @@ import {
   getLiveDataByLineId,
   getHourlyTableData,
   getFreeCounterMachines,
-  getTotalOutput, // 👈 අලුතින් එකතු කළ function එක
+  getTotalOutput,
+  getMachineStatus,
 } from "../controllers/Esp32DataController.js";
+import { verifyToken } from "../middleware/authMiddleware.js";
 
-// අලුත් Line Controller එකෙන් ගන්න දේවල්
-import { assignLine, removeAssignment, updateLineDetails } from "../controllers/LineController.js";
+const router = express.Router();
 
-const ESP32DataRouter = express.Router();
-
-// ====================================================
-// General Data Routes
-// ====================================================
-ESP32DataRouter.get("/", getAllData);
-ESP32DataRouter.get("/lines", getAllLines);
-ESP32DataRouter.get("/lines/:lineId", getLineById);
+// සියලුම ESP32 data routes සඳහා Auth අනිවාර්ය වේ
+router.use(verifyToken);
 
 // ====================================================
-// Line Management Routes (දැන් LineController එකෙන් ක්‍රියාත්මක වේ)
+// General & Status Routes
 // ====================================================
-ESP32DataRouter.post("/assign-line", assignLine);
-ESP32DataRouter.post("/remove-assignment", removeAssignment);
-ESP32DataRouter.put("/update-line", updateLineDetails); // Note: lineId එක request body එකේ යවන නිසා path එක කෙටි කළා
+router.get("/", getAllData);
+router.get("/status", getMachineStatus);
+router.get("/machine-status", getMachineStatus); // Note: You have two endpoints for the same controller
+router.get("/machines/free", getFreeCounterMachines);
+router.get("/free-counters", getFreeCounterMachines); // Note: You have two endpoints for the same controller
 
 // ====================================================
-// Machine Data Routes
+// Machine Data & Metrics Routes
 // ====================================================
-ESP32DataRouter.get("/machine/:machineId", getMachineData);
-ESP32DataRouter.get("/history/:machineId", getCounterHistory);
-ESP32DataRouter.get("/metrics/:machineId", getMachineLiveMetrics);
-ESP32DataRouter.get("/hourly-production/:machineId", getHourlyProductionData);
-ESP32DataRouter.get("/hourly-table/:machineId", getHourlyTableData);
-ESP32DataRouter.get("/:machineId/total-output", getTotalOutput); // 👈 අලුතින් එකතු කළ Route එක (404 Error එක විසඳීමට)
+router.get("/machine/:machineId", getMachineData);
+router.get("/history/:machineId", getCounterHistory);
+router.get("/metrics/:machineId", getMachineLiveMetrics);
+router.get("/hourly-production/:machineId", getHourlyProductionData);
+router.get("/hourly-table/:machineId", getHourlyTableData);
+router.get("/:machineId/total-output", getTotalOutput);
 
 // ====================================================
-// Production Gaps Routes
+// Production Gaps & Live Line Routes
 // ====================================================
-ESP32DataRouter.get("/production-gaps", getCombinedProductionGaps);
+router.get("/production-gaps", getCombinedProductionGaps);
+router.get("/live-line/:lineId", getLiveDataByLineId);
+router.get("/line-live-data/:lineId", getLiveDataByLineId); // Note: You have two endpoints for the same controller
 
-// ====================================================
-// Live Data & Free Machines Routes
-// ====================================================
-ESP32DataRouter.get("/line-live-data/:lineId", getLiveDataByLineId);
-ESP32DataRouter.get("/free-counters", getFreeCounterMachines);
-
-export default ESP32DataRouter;
+// Only ONE default export!
+export default router;

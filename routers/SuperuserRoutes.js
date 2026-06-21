@@ -1,11 +1,16 @@
-// routers/SuperuserRoutes.js
 import express from "express";
-import { getSupervisedUsers, createSupervisor } from "../controllers/SuperuserController.js";
-import { verifyToken } from "../middleware/authMiddleware.js";
+import { getSupervisedUsers, createSupervisor, blockSupervisor, unblockSupervisor } from "../controllers/SuperuserController.js";
+import { verifyToken, requireSuperuser } from "../middleware/authMiddleware.js";
 
-const router = express.Router();
-// Routes
-router.get("/users", verifyToken, getSupervisedUsers);
-router.post("/add", verifyToken, createSupervisor);
+const SuperuserRouter = express.Router();
 
-export default router;
+SuperuserRouter.use(verifyToken, requireSuperuser);
+
+SuperuserRouter.get("/users", getSupervisedUsers);
+SuperuserRouter.post("/add", createSupervisor);
+
+// Block/Unblock Routes
+SuperuserRouter.patch("/block/:id", blockSupervisor);
+SuperuserRouter.patch("/unblock/:id", unblockSupervisor);
+
+export default SuperuserRouter;

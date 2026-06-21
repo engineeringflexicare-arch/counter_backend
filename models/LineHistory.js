@@ -1,8 +1,9 @@
 import mongoose from "mongoose";
 
-const lineSchema = new mongoose.Schema(
+const lineHistorySchema = new mongoose.Schema(
   {
-    lineId: { type: String, required: true, unique: true },
+    lineId: { type: String, required: true },
+    historyDate: { type: String, required: true }, // මෙය එකතු කරන්න!
     machineId: { type: String, default: "" },
     productCode: { type: String, default: "" },
     dailyTarget: { type: Number, default: 0 },
@@ -12,18 +13,17 @@ const lineSchema = new mongoose.Schema(
     shift: { type: String, default: "" },
     floor: { type: String, default: "" },
     supervisor: { type: String, default: "" },
-    plannedDate: { type: String, default: "" },
     shiftStartTime: { type: String, default: "" },
     shiftEndTime: { type: String, default: "" },
-    assignedBy: { type: String, default: "" },
-    updatedBy: { type: String, default: "" },
   },
   {
     timestamps: true,
   },
 );
 
-const Line = mongoose.models.Line || mongoose.model("Line", lineSchema);
+// එකම field එකක් පාවිච්චි කරලා unique history එකක් තියාගන්න index එකක් දාන්න පුළුවන් (optional)
+lineHistorySchema.index({ lineId: 1, historyDate: 1 }, { unique: true });
 
-export default Line;
-export { Line };
+const LineHistory = mongoose.models.LineHistory || mongoose.model("LineHistory", lineHistorySchema);
+
+export { LineHistory };
