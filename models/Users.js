@@ -8,71 +8,138 @@ const UserSchema = new mongoose.Schema(
       unique: true,
       sparse: true,
     },
+
     FirstName: {
       type: String,
       required: [true, "First name is required"],
       trim: true,
+      maxlength: [50, "First name cannot exceed 50 characters"],
     },
+
     LastName: {
       type: String,
       required: [true, "Last name is required"],
       trim: true,
+      maxlength: [50, "Last name cannot exceed 50 characters"],
     },
+
     email: {
       type: String,
       required: [true, "Email is required"],
       unique: true,
       lowercase: true,
       trim: true,
-      match: [/^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,3})+$/, "Please provide a valid email"],
+      match: [/^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,})+$/, "Please provide a valid email"],
     },
+
     password: {
       type: String,
       required: [true, "Password is required"],
-      minlength: 6,
+      minlength: [6, "Password must be at least 6 characters"],
       select: false,
     },
+
     role: {
       type: String,
       enum: ["Admin", "Superuser", "Supervisor", "Operator"],
       default: "Operator",
     },
-    isBlocked: { type: Boolean, default: false },
-    isActive: { type: Boolean, default: true },
-    resetOTP: { type: String, default: null },
-    resetOTPExpire: { type: Date, default: null },
-    phone: { type: String, default: null },
-    department: { type: String, default: null },
-    position: { type: String, default: null },
-    profileImage: { type: String, default: null },
-    lastLogin: { type: Date, default: null },
-    loginAttempts: { type: Number, default: 0 },
-    lockoutUntil: { type: Date, default: null },
+
+    isBlocked: {
+      type: Boolean,
+      default: false,
+    },
+
+    isActive: {
+      type: Boolean,
+      default: true,
+    },
+
+    resetOTP: {
+      type: String,
+      default: null,
+    },
+
+    resetOTPExpire: {
+      type: Date,
+      default: null,
+    },
+
+    phone: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+
+    department: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+
+    position: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+
+    profileImage: {
+      type: String,
+      default: null,
+    },
+
+    lastLogin: {
+      type: Date,
+      default: null,
+    },
+
+    loginAttempts: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+
+    lockoutUntil: {
+      type: Date,
+      default: null,
+    },
   },
-  { timestamps: true },
+  {
+    timestamps: true,
+    versionKey: false,
+    toJSON: {
+      virtuals: true,
+    },
+    toObject: {
+      virtuals: true,
+    },
+  },
 );
 
-// Indexes
-UserSchema.index({ email: 1 });
-UserSchema.index({ EmployeeId: 1 });
+// ==========================================
+// Virtual Fields
+// ==========================================
 
-// Virtual Field
 UserSchema.virtual("fullName").get(function () {
   return `${this.FirstName} ${this.LastName}`;
 });
 
-// Corrected Pre-save Hook
+// ==========================================
+// Middleware
+// ==========================================
+
 UserSchema.pre("save", function () {
-  // If the email field is modified, enforce lowercase
-  if (this.isModified("email")) {
-    this.email = this.email.toLowerCase();
+  if (this.isModified("email") && this.email) {
+    this.email = this.email.toLowerCase().trim();
   }
-  // Note: No 'next()' needed here for modern Mongoose middleware
 });
 
+// ==========================================
 // Instance Methods
+// ==========================================
+
 UserSchema.methods.isResetOTPValid = function () {
-  return this.resetOTP && this.resetOTPExpire && this.resetOTPExpire > Date.now();
+  return Boolean(this.resetOTP && this.resetOTPExpire && this.resetOTPExpire.getTime() > Date.now());
 };
 
 UserSchema.methods.clearResetOTP = function () {
@@ -84,19 +151,50 @@ UserSchema.methods.getPublicProfile = function () {
   return {
     _id: this._id,
     EmployeeId: this.EmployeeId,
-    fullName: `${this.FirstName} ${this.LastName}`,
+    FirstName: this.FirstName,
+    LastName: this.LastName,
+    fullName: this.fullName,
     email: this.email,
     role: this.role,
     department: this.department,
+    position: this.position,
+    phone: this.phone,
+    profileImage: this.profileImage,
+    isActive: this.isActive,
+    isBlocked: this.isBlocked,
+    lastLogin: this.lastLogin,
+    createdAt: this.createdAt,
   };
 };
 
+// ==========================================
 // Static Methods
+// ==========================================
+
 UserSchema.statics.emailExists = async function (email) {
-  const user = await this.findOne({ email: email.toLowerCase() });
+  if (!email) return false;
+
+  const user = await this.findOne({
+    email: email.toLowerCase().trim(),
+  });
+
   return !!user;
 };
 
-const User = mongoose.model("User", UserSchema);
+UserSchema.statics.employeeExists = async function (employeeId) {
+  if (!employeeId) return false;
+
+  const user = await this.findOne({
+    EmployeeId: employeeId,
+  });
+
+  return !!user;
+};
+
+// ==========================================
+// Model Export
+// ==========================================
+
+const User = mongoose.models.User || mongoose.model("User", UserSchema);
 
 export default User;

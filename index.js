@@ -137,14 +137,33 @@ app.use((err, req, res, next) => {
 // ==========================================
 async function startServer() {
   try {
-    if (!MONGO_URI) {
-      throw new Error("MONGO_URI is missing in .env");
-    }
-
-    await mongoose.connect(MONGO_URI);
+    const mongoUri = process.env.MONGO_URI?.trim();
 
     console.log("=================================");
-    console.log("🍃 MongoDB Connected");
+    console.log("🔍 MongoDB Environment Check");
+    console.log("MONGO_URI exists:", !!mongoUri);
+
+    if (mongoUri) {
+      console.log("URI prefix:", mongoUri.substring(0, 20));
+      console.log("URI length:", mongoUri.length);
+    }
+    console.log("=================================");
+
+    if (!mongoUri) {
+      throw new Error("MONGO_URI environment variable is missing");
+    }
+
+    if (!mongoUri.startsWith("mongodb://") && !mongoUri.startsWith("mongodb+srv://")) {
+      throw new Error(`Invalid MongoDB URI format. URI must start with mongodb:// or mongodb+srv://`);
+    }
+
+    await mongoose.connect(mongoUri, {
+      serverSelectionTimeoutMS: 30000,
+      socketTimeoutMS: 45000,
+    });
+
+    console.log("=================================");
+    console.log("🍃 MongoDB Connected Successfully");
     console.log("🏠 Host:", mongoose.connection.host);
     console.log("📚 Database:", mongoose.connection.name);
     console.log("=================================");
@@ -153,18 +172,25 @@ async function startServer() {
       console.log("=================================");
       console.log(`🚀 Server running on port ${PORT}`);
 
-      // Start the background services
       startHeartbeatService();
 
       console.log(`🌍 Environment: ${process.env.NODE_ENV || "development"}`);
-      console.log(`🔗 http://localhost:${PORT}`);
+      console.log(`🔗 Port: ${PORT}`);
       console.log("=================================");
     });
   } catch (error) {
     console.error("=================================");
     console.error("❌ MongoDB Connection Failed");
+    console.error("Message:", error.message);
+
+    if (process.env.MONGO_URI) {
+      const uri = process.env.MONGO_URI.trim();
+      console.error("URI Prefix:", uri.substring(0, Math.min(30, uri.length)));
+    }
+
     console.error(error);
     console.error("=================================");
+
     process.exit(1);
   }
 }
