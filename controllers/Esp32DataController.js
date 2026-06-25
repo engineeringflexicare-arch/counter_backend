@@ -1,13 +1,11 @@
 import { get, ref } from "firebase/database";
 import { rtdb } from "../database.js";
 import jwt from "jsonwebtoken";
-
-// 🔔 අලුත් Notifier එක Import කරගැනීම
 import { Notifier } from "../utils/Notifier.js";
 
-// ==========================================
-// 1. Helper Functions
-// ==========================================
+// ============================================================================
+// 1. PRIVATE HELPER FUNCTIONS (No Import/Export path errors)
+// ============================================================================
 
 const getAuthUser = (req) => {
   const authHeader = req.headers.authorization;
@@ -21,112 +19,153 @@ const getAuthUser = (req) => {
   }
 };
 
-const generateShiftHourBuckets = (startTime, endTime) => {
-  const [startHour, startMinute] = (startTime || "08:00").split(":").map(Number);
-  const [endHour, endMinute] = (endTime || "16:00").split(":").map(Number);
+const MIN_READINGS_PER_RUN = 2;
 
-  let startMinutes = startHour * 60 + startMinute;
-  let endMinutes = endHour * 60 + endMinute;
+// FIX: Timezone Double-Offset Issue - Using String matching for dates
+const getHistoryForDate = (history, selectedDate) => {
+  if (!history || !Array.isArray(history)) return [];
+
+  const targetDate = selectedDate.replace(/-/g, "/");
+
+  return history
+    .filter((item) => {
+      if (!item.Time) return false;
+      const itemDate = item.Time.split(" ")[0].replace(/-/g, "/");
+      return itemDate === targetDate || itemDate === selectedDate;
+    })
+    .sort((a, b) => Number(a.timestamp) - Number(b.timestamp));
+};
+
+const splitIntoRuns = (rawData) => {
+  const runs = [];
+  if (!Array.isArray(rawData) || rawData.length === 0) return runs;
+
+  const data = rawData.filter((item) => !Number.isNaN(Number(item.Count)));
+  if (data.length === 0) return runs;
+
+  let currentRun = [data[0]];
+
+  for (let i = 1; i < data.length; i++) {
+    const previous = data[i - 1];
+    const current = data[i];
+
+    const prevCount = Number(previous.Count);
+    const currentCount = Number(current.Count);
+
+    if (currentCount < prevCount) {
+      if (currentRun.length >= MIN_READINGS_PER_RUN) {
+        runs.push(currentRun);
+      }
+      currentRun = [current];
+      continue;
+    }
+    currentRun.push(current);
+  }
+
+  if (currentRun.length >= MIN_READINGS_PER_RUN) {
+    runs.push(currentRun);
+  }
+  return runs;
+};
+
+// 100% Dynamic Shift Bucket Generator
+const generateShiftHourBuckets = (startTimeStr, endTimeStr) => {
+  const start = startTimeStr || "00:00";
+  const end = endTimeStr || "23:59";
+
+  const [startH, startM] = start.split(":").map(Number);
+  const [endH, endM] = end.split(":").map(Number);
+
+  let startMinutes = startH * 60 + (Number.isNaN(startM) ? 0 : startM);
+  let endMinutes = endH * 60 + (Number.isNaN(endM) ? 0 : endM);
 
   if (endMinutes <= startMinutes) {
-    endMinutes += 24 * 60;
+    endMinutes += 24 * 60; // Overnight shift support
   }
 
   const buckets = [];
   let cursor = startMinutes;
 
+  const formatTime = (totalMins) => {
+    const dayMins = ((totalMins % 1440) + 1440) % 1440;
+    const h = String(Math.floor(dayMins / 60)).padStart(2, "0");
+    const m = String(dayMins % 60).padStart(2, "0");
+    return `${h}:${m}`;
+  };
+
   while (cursor < endMinutes) {
-    const next = cursor + 60;
-    const fmt = (mins) => {
-      const wrapped = ((mins % 1440) + 1440) % 1440;
-      return `${String(Math.floor(wrapped / 60)).padStart(2, "0")}:${String(wrapped % 60).padStart(2, "0")}`;
-    };
-
+    const nextCursor = Math.min(cursor + 60, endMinutes);
     buckets.push({
-      label: `${fmt(cursor)}-${fmt(next)}`,
+      label: `${formatTime(cursor)}-${formatTime(nextCursor)}`,
       startMinutes: cursor,
-      endMinutes: next,
+      endMinutes: nextCursor,
+      output: 0,
     });
-
-    cursor = next;
+    cursor = nextCursor;
   }
 
-  return buckets;
+  return { buckets, shiftStartMinutes: startMinutes };
 };
 
-const timeToMinutesOfDay = (timeStr, dayOffsetMinutes = 0) => {
-  const timePart = timeStr.split(" ")[1];
-  const [h, m] = timePart.split(":").map(Number);
-  return h * 60 + m + dayOffsetMinutes;
-};
-
-const findBucketLabel = (buckets, minutesOfDay, shiftStartMinutes) => {
-  let adjusted = minutesOfDay;
-  if (adjusted < shiftStartMinutes) {
-    adjusted += 24 * 60;
+// Core Metrics Calculator
+const calculateProductionMetrics = (historyToday, shiftStartTime, shiftEndTime) => {
+  if (!historyToday || historyToday.length === 0) {
+    return { totalOutput: 0, hourlyData: [], firstTime: null };
   }
 
-  const bucket = buckets.find((b) => adjusted >= b.startMinutes && adjusted < b.endMinutes);
-  return bucket ? bucket.label : null;
-};
+  const firstRecord = historyToday[0];
+  const firstTimeStr = firstRecord?.Time || null;
 
-const MIN_READINGS_PER_RUN = 2;
+  const runs = splitIntoRuns(historyToday);
+  const { buckets, shiftStartMinutes } = generateShiftHourBuckets(shiftStartTime, shiftEndTime);
 
-const splitIntoRuns = (history) => {
-  const rawRuns = [];
-  let currentRun = [];
+  let totalOutput = 0;
 
-  for (let i = 0; i < history.length; i++) {
-    const current = history[i];
-    const previous = history[i - 1];
+  runs.forEach((run) => {
+    for (let i = 1; i < run.length; i++) {
+      const prev = Number(run[i - 1].Count);
+      const curr = Number(run[i].Count);
 
-    if (previous && Number(current.Count) < Number(previous.Count)) {
-      if (currentRun.length > 0) rawRuns.push(currentRun);
-      currentRun = [];
+      if (Number.isNaN(prev) || Number.isNaN(curr)) continue;
+
+      const delta = curr - prev;
+      if (delta <= 0) continue;
+
+      // FIX: Time String භාවිතා කර Timezone ගැටළුව මඟහැරීම
+      if (!run[i].Time || !run[i].Time.includes(" ")) continue;
+
+      totalOutput += delta;
+
+      const timePart = run[i].Time.split(" ")[1];
+      const [recH, recM] = timePart.split(":").map(Number);
+
+      if (Number.isNaN(recH) || Number.isNaN(recM)) continue;
+
+      let recordMinsOfDay = recH * 60 + recM;
+
+      if (recordMinsOfDay < shiftStartMinutes) {
+        recordMinsOfDay += 24 * 60;
+      }
+
+      const targetBucket = buckets.find((b) => recordMinsOfDay >= b.startMinutes && recordMinsOfDay < b.endMinutes);
+
+      if (targetBucket) {
+        targetBucket.output += delta;
+      }
     }
-
-    currentRun.push(current);
-  }
-
-  if (currentRun.length > 0) rawRuns.push(currentRun);
-  return rawRuns.filter((run) => run.length >= MIN_READINGS_PER_RUN);
-};
-
-const getRunOutput = (run) => {
-  const counts = run.map((item) => Number(item.Count));
-  return Math.max(...counts) - Math.min(...counts);
-};
-
-const getRunHourlyData = (run, buckets, shiftStartMinutes) => {
-  const outputs = {};
-  buckets.forEach((b) => {
-    outputs[b.label] = 0;
   });
 
-  for (let i = 1; i < run.length; i++) {
-    const item = run[i];
-    const prevItem = run[i - 1];
+  const hourlyData = buckets.map((b) => ({
+    hour: b.label,
+    output: b.output,
+  }));
 
-    const currentCount = Number(item.Count);
-    const previousCount = Number(prevItem.Count);
-    const delta = currentCount - previousCount;
-
-    if (delta <= 0) continue;
-
-    const minutesOfDay = timeToMinutesOfDay(item.Time);
-    const label = findBucketLabel(buckets, minutesOfDay, shiftStartMinutes);
-
-    if (label && outputs[label] !== undefined) {
-      outputs[label] += delta;
-    }
-  }
-
-  return buckets.map((b) => ({ hour: b.label, output: outputs[b.label] || 0 }));
+  return { totalOutput, hourlyData, firstTime: firstTimeStr };
 };
 
-// ==========================================
-// 2. General Data Controllers
-// ==========================================
+// ============================================================================
+// 2. GENERAL DATA CONTROLLERS
+// ============================================================================
 
 export const getAllData = async (req, res) => {
   try {
@@ -141,17 +180,15 @@ export const getAllData = async (req, res) => {
   }
 };
 
-// ==========================================
-// 4. Machine Data & Metrics Controllers
-// ==========================================
+// ============================================================================
+// 3. MACHINE DATA & METRICS CONTROLLERS
+// ============================================================================
 
 export const getTotalOutput = async (req, res) => {
   try {
     const { machineId } = req.params;
     const snapshot = await get(ref(rtdb, `Machines/${machineId}/LiveStatus/Count`));
-
     const count = snapshot.exists() ? snapshot.val() : 0;
-
     return res.status(200).json({ success: true, totalOutput: count });
   } catch (error) {
     Notifier.toAdmin("Firebase Error", `Failed to fetch Total Output for ${req.params?.machineId}: ${error.message}`, "IOT_ERROR");
@@ -213,51 +250,69 @@ export const getMachineLiveMetrics = async (req, res) => {
   }
 };
 
+// --- (1) Table Data Endpoint ---
 export const getHourlyTableData = async (req, res) => {
   const { machineId } = req.params;
+  const { date, shiftStartTime, shiftEndTime } = req.query;
+
+  const selectedDate =
+    date ||
+    (() => {
+      const now = new Date();
+      return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    })();
 
   try {
     const snapshot = await get(ref(rtdb, `Machines/${machineId}/CounterHistory`));
-    if (!snapshot.exists()) return res.status(200).json({ success: true, hourlyData: [], totalOutput: 0, firstTime: null });
-
-    const history = Object.values(snapshot.val());
-    const now = new Date();
-    const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-
-    const historyToday = history.filter((item) => item.Time && item.Time.startsWith(todayStr.replace(/-/g, "/"))).sort((a, b) => new Date(a.Time).getTime() - new Date(b.Time).getTime());
-
-    if (historyToday.length === 0) return res.status(200).json({ success: true, hourlyData: [], totalOutput: 0 });
-
-    const firstRecord = historyToday[0];
-    const firstDate = new Date(firstRecord.Time);
-    const startHour = firstDate.getHours();
-
-    const hourlyData = [];
-    let previousCount = 0;
-
-    for (let i = 0; i < 12; i++) {
-      const targetHour = (startHour + i) % 24;
-      const hourRecords = historyToday.filter((item) => new Date(item.Time).getHours() === targetHour);
-
-      const lastCount = hourRecords.length > 0 ? Number(hourRecords[hourRecords.length - 1].Count) : previousCount;
-      const output = lastCount >= previousCount ? lastCount - previousCount : lastCount;
-
-      hourlyData.push({
-        hour: `${String(targetHour).padStart(2, "0")}:00`,
-        output: output,
-      });
-      previousCount = lastCount;
+    if (!snapshot.exists()) {
+      return res.status(200).json({ success: true, hourlyData: [], totalOutput: 0, firstTime: null });
     }
 
-    res.status(200).json({
+    const historyToday = getHistoryForDate(Object.values(snapshot.val()), selectedDate);
+    const metrics = calculateProductionMetrics(historyToday, shiftStartTime, shiftEndTime);
+
+    return res.status(200).json({
       success: true,
-      totalOutput: historyToday[historyToday.length - 1].Count,
-      firstTime: firstRecord.Time,
-      hourlyData,
+      totalOutput: metrics.totalOutput,
+      firstTime: metrics.firstTime,
+      hourlyData: metrics.hourlyData,
     });
   } catch (error) {
     Notifier.toAdmin("Firebase Error", `Hourly Table Data Error [${machineId}]: ${error.message}`, "CRITICAL_ERROR");
-    res.status(500).json({ success: false, message: error.message });
+    return res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+// --- (2) Chart/Production Data Endpoint ---
+export const getHourlyProductionData = async (req, res) => {
+  const { machineId } = req.params;
+  const { date, shiftStartTime, shiftEndTime } = req.query;
+
+  const selectedDate =
+    date ||
+    (() => {
+      const now = new Date();
+      return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    })();
+
+  try {
+    const snapshot = await get(ref(rtdb, `Machines/${machineId}/CounterHistory`));
+    if (!snapshot.exists()) {
+      return res.status(200).json({ success: true, hourlyData: [], totalOutput: 0, firstTime: null });
+    }
+
+    const historyToday = getHistoryForDate(Object.values(snapshot.val()), selectedDate);
+    const metrics = calculateProductionMetrics(historyToday, shiftStartTime, shiftEndTime);
+
+    return res.status(200).json({
+      success: true,
+      totalOutput: metrics.totalOutput,
+      firstTime: metrics.firstTime,
+      hourlyData: metrics.hourlyData,
+    });
+  } catch (error) {
+    Notifier.toAdmin("Firebase Error", `Hourly Production Data Error [${machineId}]: ${error.message}`, "CRITICAL_ERROR");
+    return res.status(500).json({ success: false, message: error.message });
   }
 };
 
@@ -293,7 +348,11 @@ export const getFreeCounterMachines = async (req, res) => {
   }
 };
 
-export async function getCombinedProductionGaps(req, res) {
+// ============================================================================
+// 4. GAP ANALYSIS CONTROLLER
+// ============================================================================
+
+export const getCombinedProductionGaps = async (req, res) => {
   const { date, lineId, machineId: queryMachineId } = req.query;
   let targetMachineId = queryMachineId;
   let lineData = {};
@@ -397,11 +456,11 @@ export async function getCombinedProductionGaps(req, res) {
     Notifier.toAdmin("Firebase Error", `Production Gaps Calc Error: ${error.message}`, "CRITICAL_ERROR");
     return res.status(500).json({ success: false, message: error.message });
   }
-}
+};
 
-// ==========================================
-// 6. Live Data Routes
-// ==========================================
+// ============================================================================
+// 5. LIVE DATA & HEALTH ROUTES
+// ============================================================================
 
 export const getLiveDataByLineId = async (req, res) => {
   try {
@@ -437,10 +496,6 @@ export const getLiveDataByLineId = async (req, res) => {
   }
 };
 
-// ==========================================
-// Phase 2: Machine Health Status
-// ==========================================
-
 export const getMachineStatus = async (req, res) => {
   try {
     const machinesRef = ref(rtdb, "Machines");
@@ -469,147 +524,3 @@ export const getMachineStatus = async (req, res) => {
     return res.status(500).json({ success: false, message: "Server Error" });
   }
 };
-
-const generateShiftSlots = (dateStr, startTimeStr, endTimeStr) => {
-  const [year, month, day] = dateStr.split("-").map(Number);
-  const [startH, startM] = startTimeStr.split(":").map(Number);
-  const [endH, endM] = endTimeStr.split(":").map(Number);
-
-  const start = new Date(year, month - 1, day, startH, startM, 0);
-  const end = new Date(year, month - 1, day, endH, endM, 0);
-
-  if (end <= start) {
-    end.setDate(end.getDate() + 1);
-  }
-
-  const slots = [];
-  let current = new Date(start);
-
-  const formatTime = (d) => `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-
-  while (current < end) {
-    const next = new Date(current);
-    next.setHours(next.getHours() + 1);
-
-    slots.push({
-      label: `${formatTime(current)}-${formatTime(next)}`,
-      startTimestamp: Math.floor(current.getTime() / 1000),
-      endTimestamp: Math.floor(next.getTime() / 1000),
-    });
-
-    current.setHours(current.getHours() + 1);
-  }
-
-  return {
-    shiftSlots: slots,
-    shiftStartTs: Math.floor(start.getTime() / 1000),
-    shiftEndTs: Math.floor(end.getTime() / 1000),
-  };
-};
-
-export async function getHourlyProductionData(req, res) {
-  const { machineId } = req.params;
-  const { date, shiftStartTime, shiftEndTime } = req.query;
-
-  const startTime = shiftStartTime || "08:00";
-  const endTime = shiftEndTime || "16:00";
-  const dayBuckets = generateShiftHourBuckets(startTime, endTime);
-
-  const [startH, startM] = startTime.split(":").map(Number);
-  const dayStartMinutes = startH * 60 + startM;
-
-  const hours = dayBuckets.map((b) => b.label);
-
-  try {
-    const snapshot = await get(ref(rtdb, `Machines/${machineId}/CounterHistory`));
-
-    const selectedDate =
-      date ||
-      (() => {
-        const now = new Date();
-        return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-      })();
-
-    if (!snapshot.exists()) {
-      return res.status(200).json({
-        success: true,
-        machineId,
-        date: selectedDate,
-        totalOutput: 0,
-        currentHour: "N/A",
-        currentHourOutput: 0,
-        hourlyData: hours.map((hour) => ({ hour, output: 0 })),
-        runCount: 0,
-        runs: [],
-      });
-    }
-
-    const history = Object.values(snapshot.val())
-      .filter((item) => {
-        if (!item.Time) return false;
-        const itemDate = item.Time.split(" ")[0].replace(/\//g, "-");
-        return itemDate === selectedDate;
-      })
-      .sort((a, b) => a.Time.localeCompare(b.Time));
-
-    const runs = splitIntoRuns(history);
-
-    const chronologicalOutputs = {};
-    hours.forEach((range) => {
-      chronologicalOutputs[range] = 0;
-    });
-
-    runs.forEach((run) => {
-      for (let i = 1; i < run.length; i++) {
-        const item = run[i];
-        const prevItem = run[i - 1];
-
-        const currentCount = Number(item.Count);
-        const previousCount = Number(prevItem.Count);
-        const delta = currentCount - previousCount;
-
-        if (delta <= 0) continue;
-
-        const minutesOfDay = timeToMinutesOfDay(item.Time);
-        const range = findBucketLabel(dayBuckets, minutesOfDay, dayStartMinutes);
-
-        if (range && chronologicalOutputs[range] !== undefined) {
-          chronologicalOutputs[range] += delta;
-        }
-      }
-    });
-
-    const hourlyData = hours.map((range) => ({
-      hour: range,
-      output: chronologicalOutputs[range] || 0,
-    }));
-
-    const totalOutput = runs.reduce((sum, run) => sum + getRunOutput(run), 0);
-
-    const now = new Date();
-    const nowMinutesOfDay = now.getHours() * 60 + now.getMinutes();
-    const currentRange = findBucketLabel(dayBuckets, nowMinutesOfDay, dayStartMinutes) || "N/A";
-    const currentHourOutput = hourlyData.find((item) => item.hour === currentRange)?.output || 0;
-
-    return res.status(200).json({
-      success: true,
-      machineId,
-      date: selectedDate,
-      totalOutput,
-      currentHour: currentRange,
-      currentHourOutput,
-      hourlyData,
-      runCount: runs.length,
-      runs: runs.map((run, index) => ({
-        runNo: index + 1,
-        startTime: run[0]?.Time,
-        endTime: run[run.length - 1]?.Time,
-        totalOutput: getRunOutput(run),
-        hourlyData: getRunHourlyData(run, dayBuckets, dayStartMinutes),
-      })),
-    });
-  } catch (error) {
-    Notifier.toAdmin("Firebase Error", `Hourly Production Data Error: ${error.message}`, "CRITICAL_ERROR");
-    return res.status(500).json({ success: false, message: error.message });
-  }
-}

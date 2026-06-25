@@ -111,6 +111,8 @@ export const approveRegistration = async (req, res) => {
       email: registration.email,
       password: hashedPassword,
       role: role || "Operator",
+      department: registration.department,
+      position: registration.position,
     });
 
     const mailOptions = {
@@ -210,7 +212,7 @@ export const loginUser = async (req, res) => {
       token,
       role: user.role,
       name: user.FirstName,
-      user: { id: user._id, employeeId: user.EmployeeId, firstName: user.FirstName, lastName: user.LastName, email: user.email, role: user.role },
+      user: { id: user._id, employeeId: user.EmployeeId, firstName: user.FirstName, lastName: user.LastName, email: user.email, role: user.role, department: user.department },
     });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });

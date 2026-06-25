@@ -6,13 +6,38 @@ import { AuditLog } from "../models/AuditLog.js";
 import { Notification } from "../models/Notification.js";
 import Configuration from "../models/Configuration.js";
 import { Notifier } from "../utils/Notifier.js";
+import jwt from "jsonwebtoken"; // ✅ අනිවාර්යයෙන්ම මෙය තිබිය යුතුය
 
 // ============================================================================
-// Permission Helper (Admin ට සහ Superuser ට පමණක් වෙනස්කම් කිරීමට ඉඩ දීම)
+// Permission Helpers (✅ BUG FIX: Robust Role & Token Checking)
 // ============================================================================
+
+// Frontend එකෙන් එන Token එක කියවා User ව හඳුනාගැනීම (Middleware එකක් නැති වුවහොත්)
+const getAuthUser = (req) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
+
+  const token = authHeader.split(" ")[1];
+  try {
+    return jwt.verify(token, process.env.JWT_SECRET);
+  } catch (err) {
+    return null;
+  }
+};
+
+// 1. Admin සහ Superuser සඳහා පමණි (මැෂින් සවි කිරීමට/ගැලවීමට)
 const canEdit = (req, res) => {
-  const allowedRoles = ["Admin", "Superuser"];
-  if (req.user && allowedRoles.includes(req.user.role)) return true;
+  const user = req.user || getAuthUser(req);
+
+  if (user) {
+    // JWT එකේ role, userRole, type යන ඕනෑම නමකින් role එක ආවත් හඳුනාගැනීමට
+    const roleStr = String(user.role || user.userRole || user.type || "").toLowerCase();
+
+    if (["admin", "superuser"].includes(roleStr)) {
+      req.user = user;
+      return true;
+    }
+  }
 
   res.status(403).json({
     success: false,
@@ -21,8 +46,29 @@ const canEdit = (req, res) => {
   return false;
 };
 
+// 2. Admin, Superuser සහ Supervisor යන තිදෙනාටම (දත්ත සංස්කරණයට පමණක්)
+const canUpdateLine = (req, res) => {
+  const user = req.user || getAuthUser(req);
+
+  if (user) {
+    const roleStr = String(user.role || user.userRole || user.type || "").toLowerCase();
+
+    // supervisor ටත් මෙතැනදී අවසර හිමිවේ
+    if (["admin", "superuser", "supervisor"].includes(roleStr)) {
+      req.user = user;
+      return true;
+    }
+  }
+
+  res.status(403).json({
+    success: false,
+    message: "Access denied. Requires Admin, Superuser, or Supervisor privileges.",
+  });
+  return false;
+};
+
 // ============================================================================
-// 1. GET ALL LINES (පවතින සියලුම Lines ලබා ගැනීම)
+// 1. GET ALL LINES
 // ============================================================================
 export const getAllLines = async (req, res) => {
   try {
@@ -35,12 +81,11 @@ export const getAllLines = async (req, res) => {
 };
 
 // ============================================================================
-// 2. GET SINGLE LINE (නිශ්චිත Line එකක විස්තර පමණක් ලබා ගැනීම)
+// 2. GET SINGLE LINE
 // ============================================================================
 export const getLineById = async (req, res) => {
   try {
     const { lineId } = req.params;
-    // Note: ensure your route parameter matches this (e.g., /:lineId)
     const line = await Line.findOne({ lineId: lineId });
 
     if (!line) return res.status(404).json({ success: false, message: "Line not found" });
@@ -69,7 +114,7 @@ export const getAvailableMachines = async (req, res) => {
 };
 
 // ============================================================================
-// 4. ASSIGN LINE (Line එකකට Machine එකක් හා ඉලක්කයන් සවි කිරීම)
+// 4. ASSIGN LINE (Admin / Superuser පමණි)
 // ============================================================================
 export const assignLine = async (req, res) => {
   if (!canEdit(req, res)) return;
@@ -120,7 +165,6 @@ export const assignLine = async (req, res) => {
       changedBy: userName,
     });
 
-    // 🔔 Dispatching Notifications
     Notifier.toSuperuser("Line Assignment", `Line ${lineId} assigned to Machine ${machineId}`, "LINE_UPDATE", userName);
     Notifier.toSupervisor("New Line Assigned", `Machine ${machineId} is now assigned to Line ${lineId}`, "LINE_UPDATE", userName);
 
@@ -133,7 +177,7 @@ export const assignLine = async (req, res) => {
 };
 
 // ============================================================================
-// 5. REMOVE ASSIGNMENT (Line එකකින් Machine එකක් ඉවත් කිරීම)
+// 5. REMOVE ASSIGNMENT (Admin / Superuser පමණි)
 // ============================================================================
 export const removeAssignment = async (req, res) => {
   if (!canEdit(req, res)) return;
@@ -184,10 +228,11 @@ export const removeAssignment = async (req, res) => {
 };
 
 // ============================================================================
-// 6. UPDATE LINE DETAILS (Line එකක දත්ත පමණක් සංස්කරණය කිරීම)
+// 6. UPDATE LINE DETAILS (Supervisor ටත් අදාළ වේ)
 // ============================================================================
 export const updateLineDetails = async (req, res) => {
-  if (!canEdit(req, res)) return;
+  // ✅ FIX: මෙහි canUpdateLine භාවිතා වේ
+  if (!canUpdateLine(req, res)) return;
 
   try {
     const { lineId, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, floor, supervisor, plannedDate, shiftStartTime, shiftEndTime } = req.body;
@@ -215,7 +260,6 @@ export const updateLineDetails = async (req, res) => {
 
     const historyDate = plannedDate || new Date().toISOString().split("T")[0];
 
-    // Safe Mongoose object stripping for History saving
     const lineObj = line.toObject();
     delete lineObj._id;
     delete lineObj.__v;
@@ -245,7 +289,7 @@ export const updateLineDetails = async (req, res) => {
 };
 
 // ============================================================================
-// 7. GET LIVE DATA BY LINE ID (Firebase හරහා තථ්‍ය කාලීන දත්ත කියවීම)
+// 7. GET LIVE DATA BY LINE ID
 // ============================================================================
 export const getLiveDataByLineId = async (req, res) => {
   try {
@@ -281,7 +325,7 @@ export const getLiveDataByLineId = async (req, res) => {
 };
 
 // ============================================================================
-// 8. GET COMBINED PRODUCTION GAPS (නිෂ්පාදන ප්‍රමාදයන්/Gaps ගණනය කිරීම)
+// 8. GET COMBINED PRODUCTION GAPS
 // ============================================================================
 export const getCombinedProductionGaps = async (req, res) => {
   const { date, lineId, machineId: queryMachineId } = req.query;

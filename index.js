@@ -6,16 +6,25 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 
 // ==========================================
-// අලුතින් සකස් කළ Routers 5 Import කිරීම
+// පරණ Routers Import කිරීම
 // ==========================================
 import AdminRouter from "./routers/AdminRouter.js";
 import Esp32DataRouter from "./routers/Esp32DataRouter.js";
 import LineRouter from "./routers/LineRouter.js";
 import UserRouter from "./routers/UsersRouter.js";
 import ForgotPasswordRouter from "./routers/ForgotPasswordRouter.js";
+import SuperuserRouter from "./routers/SuperuserRoutes.js";
+
+// ==========================================
+// අලුතින් සකස් කළ MES Routers Import කිරීම
+// ==========================================
+import orderRoutes from "./routers/orderRoutes.js";
+import planRouter from "./routers/planRoutes.js";
+import inventoryRoutes from "./routers/inventoryRoutes.js";
+import capacityRoutes from "./routers/capacityRoutes.js";
+import injectionRoutes from "./routers/injectionRoutes.js";
 
 import { startHeartbeatService } from "./services/heartbeatService.js";
-import SuperuserRouter from "./routers/SuperuserRoutes.js";
 
 dotenv.config();
 
@@ -63,6 +72,7 @@ app.use(
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+    maxAge: 86400, // ✅ මෙතනට maxAge එක එකතු කරන ලදී
   }),
 );
 
@@ -100,14 +110,24 @@ app.use("/api/users/register", authLimiter);
 app.use("/api/auth", authLimiter); // Forgot Password routes සඳහා
 
 // ==========================================
-// Routes Configuration
+// Routes Configuration (End Points)
 // ==========================================
-app.use("/api/admin", AdminRouter); // Admin Operations
-app.use("/api/esp32", Esp32DataRouter); // ESP32 & Firebase Data
-app.use("/api/lines", LineRouter); // Line Management (Superuser/Admin)
-app.use("/api/users", UserRouter); // User Management & Notifications
-app.use("/api/auth", ForgotPasswordRouter); // OTP & Password Reset
-app.use("/api/superuser", SuperuserRouter); // Superuser Operations
+
+// පරණ Endpoints
+app.use("/api/admin", AdminRouter);
+app.use("/api/esp32", Esp32DataRouter);
+app.use("/api/lines", LineRouter);
+app.use("/api/users", UserRouter);
+app.use("/api/auth", ForgotPasswordRouter);
+app.use("/api/superuser", SuperuserRouter);
+
+// අලුතින් එක් කළ MES Endpoints
+app.use("/api/v1/orders", orderRoutes);
+app.use("/api/v1/production-plans", planRouter);
+app.use("/api/v1/inventory", inventoryRoutes);
+app.use("/api/v1/capacity-planning", capacityRoutes);
+app.use("/api/v1/injection-plans", injectionRoutes);
+
 // ==========================================
 // 404 Route Not Found
 // ==========================================

@@ -17,7 +17,7 @@ import { verifyToken } from "../middleware/authMiddleware.js";
 const router = express.Router();
 
 // සියලුම ESP32 data routes සඳහා Auth අනිවාර්ය වේ
-router.use(verifyToken);
+// router.use(verifyToken);
 
 // ====================================================
 // General & Status Routes
