@@ -66,4 +66,23 @@ export const deleteOrder = async (req, res) => {
   }
 };
 
-export const 
+export const markNotificationRead = async (req, res) => {
+  try {
+    const { id } = req.params;
+    await Notification.findByIdAndUpdate(id, { isRead: true });
+    res.status(200).json({ success: true, message: "Notification cleared" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const clearAllNotifications = async (req, res) => {
+  try {
+    // මෙය අදාළ User ගේ private notifications පමණක් mark as read කරයි
+    // (මුළු සිස්ටම් එකේම පොදු ඒවා මැකෙන්නේ නැත)
+    await Notification.updateMany({ targetUser: req.user.id }, { isRead: true });
+    res.status(200).json({ success: true, message: "All private notifications cleared" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
