@@ -25,6 +25,7 @@ import capacityRoutes from "./routers/capacityRoutes.js";
 import injectionRoutes from "./routers/injectionRoutes.js";
 
 import { startHeartbeatService } from "./services/heartbeatService.js";
+import MouldsRouter from "./routers/MouldRoutes.js";
 
 dotenv.config();
 
@@ -127,7 +128,7 @@ app.use("/api/v1/production-plans", planRouter);
 app.use("/api/v1/inventory", inventoryRoutes);
 app.use("/api/v1/capacity-planning", capacityRoutes);
 app.use("/api/v1/injection-plans", injectionRoutes);
-
+app.use("/api/v1/moulds", MouldsRouter);
 // ==========================================
 // 404 Route Not Found
 // ==========================================

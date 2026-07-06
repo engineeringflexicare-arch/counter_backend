@@ -2,6 +2,7 @@ import { get, ref } from "firebase/database";
 import { rtdb } from "../database.js";
 import jwt from "jsonwebtoken";
 import { Notifier } from "../utils/Notifier.js";
+import { Line } from "../models/Line.js"; // ✅ ADDED: Line details now sourced from MongoDB
 
 // ============================================================================
 // 1. PRIVATE HELPER FUNCTIONS (No Import/Export path errors)
@@ -223,25 +224,25 @@ export const getCounterHistory = async (req, res) => {
   }
 };
 
+// ✅ FIXED: Target is Line Configuration data → now sourced from MongoDB
+// instead of scanning the Firebase "Lines" node (which was a stale copy).
 export const getMachineLiveMetrics = async (req, res) => {
   try {
     const { machineId } = req.params;
     const statusSnapshot = await get(ref(rtdb, `Machines/${machineId}/LiveStatus/Count`));
-    const linesSnapshot = await get(ref(rtdb, `Lines`));
-    const linesData = linesSnapshot.val() || {};
 
-    let target = 0;
-    Object.values(linesData).forEach((line) => {
-      if (line.machineId === machineId) {
-        target = line.dailyTarget || 0;
-      }
-    });
+    // Live count → Firebase (real-time data, correct source)
+    const current = statusSnapshot.exists() ? statusSnapshot.val() : 0;
+
+    // Target → MongoDB (line configuration, correct source of truth)
+    const line = await Line.findOne({ machineId }).lean();
+    const target = line?.dailyTarget || 0;
 
     res.status(200).json({
       success: true,
       data: {
-        current: statusSnapshot.val() || 0,
-        target: target,
+        current,
+        target,
       },
     });
   } catch (error) {
@@ -316,20 +317,16 @@ export const getHourlyProductionData = async (req, res) => {
   }
 };
 
+// ✅ FIXED: "which machines are already assigned to a Line" is Line
+// Configuration data → now checked against MongoDB instead of the
+// Firebase "Lines" node.
 export const getFreeCounterMachines = async (req, res) => {
   try {
     const machineSnapshot = await get(ref(rtdb, "Machines"));
-    const lineSnapshot = await get(ref(rtdb, "Lines"));
-
     const machines = machineSnapshot.val() || {};
-    const lines = lineSnapshot.val() || {};
 
-    const assignedMachines = new Set();
-    Object.values(lines).forEach((line) => {
-      if (line.machineId && line.machineId.trim() !== "") {
-        assignedMachines.add(line.machineId);
-      }
-    });
+    const assignedLines = await Line.find({}, "machineId").lean();
+    const assignedMachines = new Set(assignedLines.map((l) => l.machineId).filter(Boolean));
 
     const freeMachines = Object.entries(machines)
       .filter(([machineId]) => !assignedMachines.has(machineId))
@@ -352,6 +349,8 @@ export const getFreeCounterMachines = async (req, res) => {
 // 4. GAP ANALYSIS CONTROLLER
 // ============================================================================
 
+// ✅ FIXED: Line configuration (shiftStartTime/shiftEndTime/dailyTarget) now
+// sourced from MongoDB instead of the Firebase "Lines" node.
 export const getCombinedProductionGaps = async (req, res) => {
   const { date, lineId, machineId: queryMachineId } = req.query;
   let targetMachineId = queryMachineId;
@@ -359,12 +358,12 @@ export const getCombinedProductionGaps = async (req, res) => {
 
   try {
     if (lineId) {
-      const lineSnapshot = await get(ref(rtdb, `Lines/${lineId}`));
-      if (!lineSnapshot.exists()) {
+      const line = await Line.findOne({ lineId }).lean();
+      if (!line) {
         return res.status(404).json({ success: false, message: "Line not found" });
       }
-      lineData = lineSnapshot.val();
-      targetMachineId = lineData.machineId;
+      lineData = line;
+      targetMachineId = line.machineId;
 
       if (!targetMachineId) {
         return res.status(404).json({ success: false, message: "No machine assigned to this line" });
@@ -381,12 +380,9 @@ export const getCombinedProductionGaps = async (req, res) => {
       return res.status(404).json({ success: false, message: "No CounterHistory found" });
     }
 
-    const machineSnapshot = await get(ref(rtdb, `Machines/${targetMachineId}`));
-    const machineData = machineSnapshot.val() || {};
-
-    const startTime = lineData.shiftStartTime || machineData.productionStartTime || "08:30";
-    const endTime = lineData.shiftEndTime || machineData.productionEndTime || "20:30";
-    const dailyTarget = Number(lineData.dailyTarget || machineData.dailyTarget || 0);
+    const startTime = lineData.shiftStartTime || "08:30";
+    const endTime = lineData.shiftEndTime || "20:30";
+    const dailyTarget = Number(lineData.dailyTarget || 0);
 
     const selectedDate =
       date ||
@@ -462,35 +458,44 @@ export const getCombinedProductionGaps = async (req, res) => {
 // 5. LIVE DATA & HEALTH ROUTES
 // ============================================================================
 
+// ✅ FIXED (Main Bug): Line details (target, productCode, shift times,
+// machineId) now sourced from MongoDB — the source of truth kept up to
+// date by Line Assignment / Lines Update pages — instead of the stale
+// Firebase "Lines" node. Firebase is used ONLY for the live Count.
+// Response shape is UNCHANGED — 100% backward compatible with frontend.
 export const getLiveDataByLineId = async (req, res) => {
   try {
     const { lineId } = req.params;
-    const lineSnapshot = await get(ref(rtdb, `Lines/${lineId}`));
 
-    if (!lineSnapshot.exists()) {
+    // Step 01 & 02: Get Line details + machineId from MongoDB
+    const line = await Line.findOne({ lineId }).lean();
+
+    if (!line) {
       return res.status(404).json({ success: false, message: "Line not found" });
     }
 
-    const lineData = lineSnapshot.val();
-    const machineId = lineData.machineId;
+    const machineId = line.machineId;
 
     if (!machineId) {
       return res.status(404).json({ success: false, message: "No machine assigned to this line" });
     }
 
+    // Step 03: Get live Count ONLY from Firebase
     const statusSnapshot = await get(ref(rtdb, `Machines/${machineId}/LiveStatus/Count`));
     const count = statusSnapshot.exists() ? statusSnapshot.val() : 0;
 
+    // Step 04: Response — SAME shape as before, endTime now correctly populated
     return res.status(200).json({
       success: true,
       count,
-      target: lineData.dailyTarget || 0,
-      productCode: lineData.productCode || "—",
-      startTime: lineData.shiftStartTime || "—",
+      target: line.dailyTarget || 0,
+      productCode: line.productCode || "—",
+      startTime: line.shiftStartTime || "—",
+      endTime: line.shiftEndTime || "—",
       machineId,
     });
   } catch (error) {
-    console.error("Error fetching free counters:", error);
+    console.error("Error fetching line live data:", error);
     Notifier.toAdmin("Firebase Error", `Live Data Error [${req.params?.lineId}]: ${error.message}`, "IOT_ERROR");
     res.status(500).json({ success: false, message: "Server Error" });
   }

@@ -6,7 +6,7 @@ import { AuditLog } from "../models/AuditLog.js";
 import { Notification } from "../models/Notification.js";
 import Configuration from "../models/Configuration.js";
 import { Notifier } from "../utils/Notifier.js";
-import jwt from "jsonwebtoken"; // ✅ අනිවාර්යයෙන්ම මෙය තිබිය යුතුය
+import jwt from "jsonwebtoken";
 
 // ============================================================================
 // Permission Helpers (✅ BUG FIX: Robust Role & Token Checking)
@@ -30,7 +30,6 @@ const canEdit = (req, res) => {
   const user = req.user || getAuthUser(req);
 
   if (user) {
-    // JWT එකේ role, userRole, type යන ඕනෑම නමකින් role එක ආවත් හඳුනාගැනීමට
     const roleStr = String(user.role || user.userRole || user.type || "").toLowerCase();
 
     if (["admin", "superuser"].includes(roleStr)) {
@@ -53,7 +52,7 @@ const canUpdateLine = (req, res) => {
   if (user) {
     const roleStr = String(user.role || user.userRole || user.type || "").toLowerCase();
 
-    // supervisor ටත් මෙතැනදී අවසර හිමිවේ
+    // ✅ supervisor ටත් මෙතැනදී අවසර හිමිවේ
     if (["admin", "superuser", "supervisor"].includes(roleStr)) {
       req.user = user;
       return true;
@@ -114,10 +113,11 @@ export const getAvailableMachines = async (req, res) => {
 };
 
 // ============================================================================
-// 4. ASSIGN LINE (Admin / Superuser පමණි)
+// 4. ASSIGN LINE (Admin / Supervisor පමණි)
 // ============================================================================
 export const assignLine = async (req, res) => {
-  if (!canEdit(req, res)) return;
+  // ✅ FIX: canEdit වෙනුවට canUpdateLine යොදා ඇත (Supervisor ට අවසර දීමට)
+  if (!canUpdateLine(req, res)) return;
 
   try {
     const { lineId, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, supervisor, shiftStartTime, shiftEndTime, floor } = req.body;
@@ -177,10 +177,11 @@ export const assignLine = async (req, res) => {
 };
 
 // ============================================================================
-// 5. REMOVE ASSIGNMENT (Admin / Superuser පමණි)
+// 5. REMOVE ASSIGNMENT (Admin / Supervisor/planner පමණි)
 // ============================================================================
 export const removeAssignment = async (req, res) => {
-  if (!canEdit(req, res)) return;
+  // ✅ FIX: canEdit වෙනුවට canUpdateLine යොදා ඇත (Supervisor ට අවසර දීමට)
+  if (!canUpdateLine(req, res)) return;
 
   try {
     const { lineId } = req.body;
@@ -231,7 +232,6 @@ export const removeAssignment = async (req, res) => {
 // 6. UPDATE LINE DETAILS (Supervisor ටත් අදාළ වේ)
 // ============================================================================
 export const updateLineDetails = async (req, res) => {
-  // ✅ FIX: මෙහි canUpdateLine භාවිතා වේ
   if (!canUpdateLine(req, res)) return;
 
   try {
