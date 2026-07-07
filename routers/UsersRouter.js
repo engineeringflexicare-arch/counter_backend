@@ -18,6 +18,9 @@ import {
   markNotificationRead,
   clearAllNotifications,
   getNotifications,
+  forgotPassword,
+  verifyOTP,
+  resetPassword,
 } from "../controllers/UserController.js";
 
 const router = express.Router();
@@ -27,6 +30,10 @@ const router = express.Router();
 // ==========================================
 router.post("/login", loginUser);
 router.post("/register", submitRegistration);
+
+router.post("/forgot-password", forgotPassword);
+router.post("/verify-otp", verifyOTP);
+router.post("/reset-password", resetPassword);
 
 // ==========================================
 // Notification Routes (Require Auth)

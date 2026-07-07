@@ -119,7 +119,23 @@ export const approveRegistration = async (req, res) => {
       from: process.env.EMAIL_USER,
       to: registration.email,
       subject: "Flexicare Account Approved! 🎉",
-      html: `...`, // (ඔයාගේ කලින් තිබ්බ Email HTML template එක මෙතන තියෙනවා යැයි සිතන්න)
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 16px;">
+          <h2 style="color: #1e293b;">Welcome to Flexicare! 🎉</h2>
+          <p style="color: #475569; font-size: 14px;">
+            Hi ${registration.firstName},<br/>
+            Your account request has been approved by the admin. You can now log in using the credentials below.
+          </p>
+          <div style="background: #f1f5f9; border-radius: 12px; padding: 16px; margin: 24px 0;">
+            <p style="margin: 4px 0; color: #1e293b;"><strong>Employee ID:</strong> ${randomEmpId}</p>
+            <p style="margin: 4px 0; color: #1e293b;"><strong>Temporary Password:</strong> ${defaultPassword}</p>
+          </div>
+          <p style="color: #64748b; font-size: 13px;">
+            Please log in and change your password immediately for security reasons.
+          </p>
+          <p style="color: #94a3b8; font-size: 12px; margin-top: 24px;">— Flexicare System</p>
+        </div>
+      `,
     };
 
     await transporter.sendMail(mailOptions);
@@ -326,7 +342,6 @@ export const unblockUser = async (req, res) => {
 // ==========================================
 
 export const forgotPassword = async (req, res) => {
-  // (කලින් තිබුණු කෝඩ් එකමයි, වෙනසක් නැත)
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ success: false, message: "Email is required" });
@@ -343,7 +358,22 @@ export const forgotPassword = async (req, res) => {
       from: process.env.EMAIL_USER,
       to: user.email,
       subject: "Password Reset OTP - Flexicare",
-      html: `...`, // (කලින් තිබ්බ OTP Email එක)
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 480px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 16px;">
+          <h2 style="color: #1e293b; margin-bottom: 8px;">Password Reset Request</h2>
+          <p style="color: #475569; font-size: 14px;">
+            Hi ${user.FirstName || ""},<br/>
+            We received a request to reset your Flexicare account password. Use the OTP code below to proceed. This code is valid for <strong>15 minutes</strong>.
+          </p>
+          <div style="background: #f1f5f9; border-radius: 12px; padding: 16px; text-align: center; margin: 24px 0;">
+            <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #2563eb;">${otp}</span>
+          </div>
+          <p style="color: #64748b; font-size: 13px;">
+            If you did not request this password reset, please ignore this email or contact your administrator.
+          </p>
+          <p style="color: #94a3b8; font-size: 12px; margin-top: 24px;">— Flexicare System</p>
+        </div>
+      `,
     };
 
     await transporter.sendMail(mailOptions);
@@ -354,7 +384,6 @@ export const forgotPassword = async (req, res) => {
 };
 
 export const verifyOTP = async (req, res) => {
-  // (කලින් තිබුණු කෝඩ් එකමයි, වෙනසක් නැත)
   try {
     const { email, otp } = req.body;
     if (!email || !otp) return res.status(400).json({ success: false, message: "Email and OTP are required" });
