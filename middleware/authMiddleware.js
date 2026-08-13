@@ -24,11 +24,10 @@ export const verifyToken = (req, res, next) => {
 
 // Role Hierarchy Mapping (lower number = higher privilege)
 const roleHierarchy = {
-  SuperAdmin: 1,
-  Admin: 2,
-  Superuser: 3,
-  Supervisor: 4,
-  Viewer: 5,
+  Admin: 1,
+  Superuser: 2,
+  Supervisor: 3,
+  Operator: 4,
 };
 
 const checkRole = (minRoleLevel) => {
@@ -38,7 +37,7 @@ const checkRole = (minRoleLevel) => {
     }
 
     const userRoleLevel = roleHierarchy[req.user.role];
-    
+
     if (!userRoleLevel || userRoleLevel > minRoleLevel) {
       return res.status(403).json({ success: false, message: `Forbidden: Requires higher privileges` });
     }
@@ -50,4 +49,4 @@ const checkRole = (minRoleLevel) => {
 export const requireAdmin = checkRole(roleHierarchy.Admin);
 export const requireSuperuser = checkRole(roleHierarchy.Superuser);
 export const requireSupervisor = checkRole(roleHierarchy.Supervisor);
-export const requireViewer = checkRole(roleHierarchy.Viewer);
+export const requireOperator = checkRole(roleHierarchy.Operator);

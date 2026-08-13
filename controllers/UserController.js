@@ -247,9 +247,19 @@ export const getUsers = async (req, res) => {
 export const getSingleUser = async (req, res) => {
   try {
     const { id } = req.params;
-    const user = await User.findById(id);
+    const user = await User.findById(id).select("-password");
     if (!user) return res.status(404).json({ success: false, message: "User not found" });
     res.status(200).json({ success: true, data: user });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+export const getCurrentUser = async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select("-password");
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
+    res.status(200).json({ success: true, data: user.getPublicProfile() });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -260,23 +270,67 @@ export const updateUser = async (req, res) => {
     const { id } = req.params;
     const updateData = { ...req.body };
 
+    // Prevent changing immutable/internal fields
+    delete updateData._id;
+    delete updateData.createdAt;
+    delete updateData.updatedAt;
+
+    const isAdmin = req.user && req.user.role === "Admin";
+
+    // Normalize and validate email uniqueness
     if (updateData.email) {
-      const existingUser = await User.findOne({ email: updateData.email, _id: { $ne: id } });
+      const emailToCheck = updateData.email.toLowerCase().trim();
+      const existingUser = await User.findOne({ email: emailToCheck, _id: { $ne: id } });
       if (existingUser) return res.status(400).json({ success: false, message: "Email already in use" });
+      updateData.email = emailToCheck;
     }
 
-    if (updateData.EmployeeId) {
-      const existingEmp = await User.findOne({ EmployeeId: updateData.EmployeeId, _id: { $ne: id } });
+    // Validate EmployeeId uniqueness and normalize to Number
+    if (typeof updateData.EmployeeId !== "undefined" && updateData.EmployeeId !== null && updateData.EmployeeId !== "") {
+      const empIdNum = Number(updateData.EmployeeId);
+      if (Number.isNaN(empIdNum)) return res.status(400).json({ success: false, message: "EmployeeId must be a number" });
+      const existingEmp = await User.findOne({ EmployeeId: empIdNum, _id: { $ne: id } });
       if (existingEmp) return res.status(400).json({ success: false, message: "Employee ID already in use" });
+      updateData.EmployeeId = empIdNum;
     }
 
+    // Hash password if provided
     if (updateData.password) {
       const salt = await bcrypt.genSalt(10);
       updateData.password = await bcrypt.hash(updateData.password, salt);
     }
 
-    const user = await User.findByIdAndUpdate(id, updateData, { new: true });
+    // Non-admins should not be allowed to change role or blocked/active status via this endpoint
+    if (!isAdmin) {
+      delete updateData.role;
+      delete updateData.isBlocked;
+      delete updateData.isActive;
+    }
+
+    const existingUser = await User.findById(id);
+    if (!existingUser) return res.status(404).json({ success: false, message: "User not found" });
+
+    const prevRole = existingUser.role;
+    const prevBlocked = existingUser.isBlocked;
+
+    const user = await User.findByIdAndUpdate(id, updateData, { new: true, runValidators: true });
     if (!user) return res.status(404).json({ success: false, message: "User not found" });
+
+    // Notify user if role changed by admin
+    if (isAdmin && updateData.role && updateData.role !== prevRole) {
+      Notifier.toUser(user._id, "Role Updated", `Your role was updated to ${user.role}`, "ACCOUNT_UPDATE", req.user?.name);
+    }
+
+    // Notify on block/unblock actions performed by admin
+    if (isAdmin && typeof updateData.isBlocked !== "undefined" && updateData.isBlocked !== prevBlocked) {
+      if (updateData.isBlocked) {
+        Notifier.toUser(user._id, "Account Blocked", "Your account has been blocked by an administrator.", "USER_STATUS", req.user?.name);
+        Notifier.toSuperuser("Account Blocked", `${user.FirstName} ${user.LastName}'s account was blocked.`, "USER_MANAGEMENT", req.user?.name);
+      } else {
+        Notifier.toUser(user._id, "Account Unblocked", "Your account has been unblocked by an administrator.", "USER_STATUS", req.user?.name);
+        Notifier.toSuperuser("Account Unblocked", `${user.FirstName} ${user.LastName}'s account was unblocked.`, "USER_MANAGEMENT", req.user?.name);
+      }
+    }
 
     res.status(200).json({ success: true, message: "User updated successfully", user });
   } catch (error) {
