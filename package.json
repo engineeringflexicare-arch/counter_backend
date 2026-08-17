@@ -29,5 +29,11 @@
     "node-cron": "^4.4.1",
     "nodemailer": "^9.0.0",
     "nodemon": "^3.1.14"
+  },
+  "allowScripts": {
+    "bcrypt@6.0.0": true,
+    "node@26.7.0": true,
+    "protobufjs@7.6.5": true,
+    "@firebase/util@1.15.2": true
   }
 }
