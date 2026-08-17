@@ -9,6 +9,7 @@ import {
   createUser,
   getUsers,
   getSingleUser,
+  getCurrentUser,
   updateUser,
   deleteUser,
   blockUser,
@@ -41,6 +42,11 @@ router.post("/reset-password", resetPassword);
 router.get("/notifications", verifyToken, getNotifications);
 router.patch("/notification/:id/read", verifyToken, markNotificationRead);
 router.post("/notifications/clear-all", verifyToken, clearAllNotifications);
+
+// ==========================================
+// Current User Routes
+// ==========================================
+router.get("/profile", verifyToken, getCurrentUser);
 
 // ==========================================
 // Admin Protected User Routes

@@ -12,7 +12,6 @@ import jwt from "jsonwebtoken";
 // Permission Helpers (✅ BUG FIX: Robust Role & Token Checking)
 // ============================================================================
 
-// Frontend එකෙන් එන Token එක කියවා User ව හඳුනාගැනීම (Middleware එකක් නැති වුවහොත්)
 const getAuthUser = (req) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) return null;
@@ -25,7 +24,6 @@ const getAuthUser = (req) => {
   }
 };
 
-// 1. Admin සහ Superuser සඳහා පමණි (මැෂින් සවි කිරීමට/ගැලවීමට)
 const canEdit = (req, res) => {
   const user = req.user || getAuthUser(req);
 
@@ -45,14 +43,12 @@ const canEdit = (req, res) => {
   return false;
 };
 
-// 2. Admin, Superuser සහ Supervisor යන තිදෙනාටම (දත්ත සංස්කරණයට පමණක්)
 const canUpdateLine = (req, res) => {
   const user = req.user || getAuthUser(req);
 
   if (user) {
     const roleStr = String(user.role || user.userRole || user.type || "").toLowerCase();
 
-    // ✅ supervisor ටත් මෙතැනදී අවසර හිමිවේ
     if (["admin", "superuser", "supervisor"].includes(roleStr)) {
       req.user = user;
       return true;
@@ -116,7 +112,6 @@ export const getAvailableMachines = async (req, res) => {
 // 4. ASSIGN LINE (Admin / Supervisor පමණි)
 // ============================================================================
 export const assignLine = async (req, res) => {
-  // ✅ FIX: canEdit වෙනුවට canUpdateLine යොදා ඇත (Supervisor ට අවසර දීමට)
   if (!canUpdateLine(req, res)) return;
 
   try {
@@ -177,23 +172,39 @@ export const assignLine = async (req, res) => {
 };
 
 // ============================================================================
-// 5. REMOVE ASSIGNMENT (Admin / Supervisor/planner පමණි)
+// 5. REMOVE ASSIGNMENT (✅ FIXED: findOneAndUpdate + debug logs + trim/case-safe match)
 // ============================================================================
 export const removeAssignment = async (req, res) => {
-  // ✅ FIX: canEdit වෙනුවට canUpdateLine යොදා ඇත (Supervisor ට අවසර දීමට)
   if (!canUpdateLine(req, res)) return;
 
   try {
     const { lineId } = req.body;
-    if (!lineId) return res.status(400).json({ success: false, message: "Line ID required" });
 
-    const line = await Line.findOne({ lineId });
-    if (!line) return res.status(404).json({ success: false, message: "Line not found" });
+    console.log("🗑️  [REMOVE] Incoming request body:", req.body);
+
+    if (!lineId || !lineId.toString().trim()) {
+      console.log("❌ [REMOVE] No lineId provided in request body");
+      return res.status(400).json({ success: false, message: "Line ID required" });
+    }
+
+    const cleanLineId = lineId.toString().trim();
+
+    // Case-insensitive, whitespace-safe lookup
+    const line = await Line.findOne({
+      lineId: { $regex: new RegExp(`^${cleanLineId}$`, "i") },
+    });
+
+    if (!line) {
+      console.log(`❌ [REMOVE] Line not found for lineId: "${cleanLineId}"`);
+      return res.status(404).json({ success: false, message: "Line not found" });
+    }
+
+    console.log("✅ [REMOVE] Line found:", line.lineId, "| Current machineId:", line.machineId);
 
     const oldData = line.toObject();
     const oldMachineId = line.machineId;
 
-    Object.assign(line, {
+    const clearedFields = {
       machineId: "",
       productCode: "",
       dailyTarget: 0,
@@ -205,24 +216,28 @@ export const removeAssignment = async (req, res) => {
       shiftStartTime: "",
       shiftEndTime: "",
       floor: "",
-    });
+    };
 
-    await line.save();
+    // ✅ Use findOneAndUpdate with $set instead of .save() — more reliable for clearing fields
+    const updatedLine = await Line.findOneAndUpdate({ _id: line._id }, { $set: clearedFields }, { new: true });
+
+    console.log("✅ [REMOVE] Line updated in MongoDB:", updatedLine);
 
     await AuditLog.create({
       action: "LINE_CLEARED",
       entity: "Line",
-      entityId: lineId,
+      entityId: line.lineId,
       oldData,
-      newData: line,
+      newData: updatedLine,
       changedBy: req.user?.name || "System",
     });
 
-    Notifier.toSuperuser("Assignment Cleared", `Machine ${oldMachineId} removed from Line ${lineId}`, "LINE_UPDATE", req.user?.name);
-    Notifier.toSupervisor("Assignment Cleared", `Line ${lineId} is now unassigned`, "LINE_UPDATE", req.user?.name);
+    Notifier.toSuperuser("Assignment Cleared", `Machine ${oldMachineId} removed from Line ${line.lineId}`, "LINE_UPDATE", req.user?.name);
+    Notifier.toSupervisor("Assignment Cleared", `Line ${line.lineId} is now unassigned`, "LINE_UPDATE", req.user?.name);
 
-    return res.status(200).json({ success: true, message: "Assignment removed successfully" });
+    return res.status(200).json({ success: true, message: "Assignment removed successfully", data: updatedLine });
   } catch (error) {
+    console.error("❌ [REMOVE] Error:", error);
     Notifier.toAdmin("System Error", `Remove Assignment Error: ${error.message}`, "CRITICAL_ERROR", req.user?.name);
     return res.status(500).json({ success: false, message: error.message });
   }

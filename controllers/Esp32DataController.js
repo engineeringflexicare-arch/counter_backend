@@ -1,8 +1,9 @@
-import { get, ref } from "firebase/database";
+import { get, ref, remove, update } from "firebase/database";
 import { rtdb } from "../database.js";
 import jwt from "jsonwebtoken";
 import { Notifier } from "../utils/Notifier.js";
 import { Line } from "../models/Line.js";
+import { InjectionMachine } from "../models/InjectionMachine.js";
 
 // ============================================================================
 // 1. AUTH HELPER
@@ -25,131 +26,118 @@ const getAuthUser = (req) => {
 // ============================================================================
 
 const MIN_READINGS_PER_RUN = 2;
-
-// Explicit device-reported reset signals (firmware event field), if present.
 const RESET_EVENT_TYPES = new Set(["BOOT", "RESET", "MANUAL_RESET", "POWER_ON"]);
-
-// A drop of this ratio or more (e.g. 0.8 = 80%) is treated as a genuine
-// counter reset even if it doesn't land exactly on 0/1.
 const RESET_DROP_RATIO = 0.8;
-
-// Counter must fall to <= this value to qualify as "restarted from 0/1".
 const RESTART_COUNT_THRESHOLD = 1;
-
-// A "restart to 0/1" is only trusted as a real reset if the PREVIOUS count
-// was meaningfully large — protects against noise at the very start of a
-// shift when counts are naturally still near 0.
 const SIGNIFICANT_COUNT_FLOOR = 5;
-
-// Any drop this small (absolute) is sensor/network noise, never a reset.
-// e.g. 233 -> 232 -> 234
 const SMALL_FLUCTUATION_ABS = 5;
-
-// Any drop below this ratio of the previous count is also noise.
 const SMALL_FLUCTUATION_RATIO = 0.02;
-
-// Clock-jitter tolerance (seconds) before a lower timestamp is treated as
-// a genuinely out-of-order / delayed packet rather than normal jitter.
 const OUT_OF_ORDER_TOLERANCE_SECONDS = 5;
 
 // ============================================================================
-// 3. HISTORY / RUN-DETECTION HELPERS
+// 3. HISTORY / RUN-DETECTION HELPERS (🔥 FIXED FOR OVERNIGHT SHIFTS)
 // ============================================================================
 
-// FIX: Timezone Double-Offset Issue - Using String matching for dates
-const getHistoryForDate = (history, selectedDate) => {
+// යම් වෙලාවක් shift එක ආරම්භ වූ දිනය කුමක්දැයි නිවැරදිව සොයා ගනී
+const getLogicalShiftDate = (selectedDate, startTime, endTime) => {
+  if (selectedDate) return selectedDate;
+
+  const now = new Date();
+  const [sh, sm] = (startTime || "00:00").split(":").map(Number);
+  const [eh, em] = (endTime || "23:59").split(":").map(Number);
+  const isOvernight = sh * 60 + sm > eh * 60 + em;
+
+  const shiftStartTimeToday = new Date(now);
+  shiftStartTimeToday.setHours(sh, sm, 0, 0);
+
+  // Overnight shift එකක් වී, දැනට වෙලාව උදේ පාන්දර නම් (shift එක ඉවර වෙන්න කලින්),
+  // එය අයිති වන්නේ ඊයේ දවසේ shift එකටයි.
+  if (isOvernight && now < shiftStartTimeToday && now.getHours() < eh) {
+    const yesterday = new Date(now);
+    yesterday.setDate(yesterday.getDate() - 1);
+    return `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, "0")}-${String(yesterday.getDate()).padStart(2, "0")}`;
+  }
+
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+};
+
+// දින දෙකක් අතර පැතිරෙන (Cross-midnight) Shift එකක් වුවත් සම්පූර්ණ දත්ත පරාසයම ලබා ගනී
+const getShiftHistory = (history, logicalDateStr, startTimeStr, endTimeStr) => {
   if (!history || !Array.isArray(history)) return [];
 
-  const targetDate = selectedDate.replace(/-/g, "/");
+  const [startH, startM] = (startTimeStr || "00:00").split(":").map(Number);
+  const [endH, endM] = (endTimeStr || "23:59").split(":").map(Number);
+  const isOvernight = startH * 60 + startM >= endH * 60 + endM;
+
+  const shiftStart = new Date(`${logicalDateStr}T${String(startH).padStart(2, "0")}:${String(startM).padStart(2, "0")}:00`);
+  const shiftEnd = new Date(`${logicalDateStr}T${String(endH).padStart(2, "0")}:${String(endM).padStart(2, "0")}:00`);
+
+  if (isOvernight) {
+    shiftEnd.setDate(shiftEnd.getDate() + 1); // ඊළඟ දවසට දික් කිරීම
+  }
 
   return history
     .filter((item) => {
       if (!item.Time) return false;
-      const itemDate = item.Time.split(" ")[0].replace(/-/g, "/");
-      return itemDate === targetDate || itemDate === selectedDate;
+      const itemDate = new Date(item.Time.replace(/\//g, "-"));
+      return itemDate >= shiftStart && itemDate <= shiftEnd;
     })
-    .sort((a, b) => Number(a.timestamp) - Number(b.timestamp));
+    .sort((a, b) => {
+      const tA = Number(a.timestamp) || new Date(a.Time.replace(/\//g, "-")).getTime();
+      const tB = Number(b.timestamp) || new Date(b.Time.replace(/\//g, "-")).getTime();
+      return tA - tB;
+    });
 };
 
-// Requirement 3: explicit reset event reported by firmware
 const isExplicitResetEvent = (item) => {
   const eventValue = item?.event ?? item?.Event ?? item?.eventType ?? item?.EventType ?? null;
   if (!eventValue) return false;
   return RESET_EVENT_TYPES.has(String(eventValue).toUpperCase().trim());
 };
 
-// Requirement 4: bootId/runId change reported by firmware
 const hasRunIdentifierChanged = (previous, current) => {
   const prevId = previous?.bootId ?? previous?.BootId ?? previous?.runId ?? previous?.RunId ?? null;
   const currId = current?.bootId ?? current?.BootId ?? current?.runId ?? current?.RunId ?? null;
-
-  // If firmware doesn't send an identifier, this signal simply doesn't apply.
   if (prevId === null || currId === null) return false;
   return String(prevId) !== String(currId);
 };
 
-// ============================================================================
-// RUN SPLITTER — rewritten for real-world IoT reliability
-// ============================================================================
-// A "new run" is only created when a reset is VERIFIED via one of several
-// independent signals. Duplicates, delayed/out-of-order packets, and small
-// sensor noise are all absorbed WITHOUT splitting a run or corrupting output.
 const splitIntoRuns = (rawData) => {
   const runs = [];
   if (!Array.isArray(rawData) || rawData.length === 0) return runs;
 
-  // Step 1: drop records with no usable numeric Count.
   const sanitized = rawData.filter((item) => !Number.isNaN(Number(item.Count)));
   if (sanitized.length === 0) return runs;
 
-  // Step 2: defensive re-sort by timestamp. Never trust that upstream data
-  // arrived in order — network delay can reorder packets before they reach
-  // Firebase, and this must never be misread as a reset.
-  const data = [...sanitized].sort((a, b) => {
-    const tA = Number(a.timestamp) || 0;
-    const tB = Number(b.timestamp) || 0;
-    return tA - tB;
-  });
+  const data = [...sanitized].sort((a, b) => (Number(a.timestamp) || 0) - (Number(b.timestamp) || 0));
 
   const runsBuffer = [];
   let currentRun = [data[0]];
-  let lastValid = data[0]; // last reading actually accepted into the current run
+  let lastValid = data[0];
 
   for (let i = 1; i < data.length; i++) {
     const candidate = data[i];
     const prevCount = Number(lastValid.Count);
     const currCount = Number(candidate.Count);
 
-    // --- Guard A: Duplicate packet (Requirement 7) ---------------------
-    if (currCount === prevCount) {
-      continue;
-    }
+    if (currCount === prevCount) continue;
 
-    // --- Guard B: Out-of-order / delayed packet (Requirement 6, 8) -----
     const lastTs = Number(lastValid.timestamp);
     const candidateTs = Number(candidate.timestamp);
     if (!Number.isNaN(lastTs) && !Number.isNaN(candidateTs) && candidateTs < lastTs - OUT_OF_ORDER_TOLERANCE_SECONDS) {
       continue;
     }
 
-    // --- Guard C: Small fluctuation / noise (Requirement 5) -------------
     if (currCount < prevCount) {
       const drop = prevCount - currCount;
       const dropRatio = prevCount > 0 ? drop / prevCount : 0;
-      const isSmallFluctuation = drop <= SMALL_FLUCTUATION_ABS || dropRatio < SMALL_FLUCTUATION_RATIO;
-
-      if (isSmallFluctuation) {
-        continue;
-      }
+      if (drop <= SMALL_FLUCTUATION_ABS || dropRatio < SMALL_FLUCTUATION_RATIO) continue;
     }
 
-    // --- Strong signals: these override count math entirely -----------
-    const explicitReset = isExplicitResetEvent(candidate); // Requirement 3
-    const bootIdChanged = hasRunIdentifierChanged(lastValid, candidate); // Requirement 4
+    const explicitReset = isExplicitResetEvent(candidate);
+    const bootIdChanged = hasRunIdentifierChanged(lastValid, candidate);
 
-    // --- Guard D: verified reset decision (Requirements 1, 2, 9) --------
     let isRealReset = false;
-
     if (explicitReset || bootIdChanged) {
       isRealReset = true;
     } else if (currCount <= RESTART_COUNT_THRESHOLD && prevCount > SIGNIFICANT_COUNT_FLOOR) {
@@ -157,9 +145,7 @@ const splitIntoRuns = (rawData) => {
     } else if (currCount < prevCount) {
       const drop = prevCount - currCount;
       const dropRatio = prevCount > 0 ? drop / prevCount : 0;
-      if (dropRatio >= RESET_DROP_RATIO) {
-        isRealReset = true;
-      }
+      if (dropRatio >= RESET_DROP_RATIO) isRealReset = true;
     }
 
     if (isRealReset) {
@@ -171,7 +157,6 @@ const splitIntoRuns = (rawData) => {
       continue;
     }
 
-    // --- Default: normal continuing production --------------------------
     currentRun.push(candidate);
     lastValid = candidate;
   }
@@ -183,7 +168,6 @@ const splitIntoRuns = (rawData) => {
   return runsBuffer;
 };
 
-// 100% Dynamic Shift Bucket Generator
 const generateShiftHourBuckets = (startTimeStr, endTimeStr) => {
   const start = startTimeStr || "00:00";
   const end = endTimeStr || "23:59";
@@ -194,9 +178,7 @@ const generateShiftHourBuckets = (startTimeStr, endTimeStr) => {
   let startMinutes = startH * 60 + (Number.isNaN(startM) ? 0 : startM);
   let endMinutes = endH * 60 + (Number.isNaN(endM) ? 0 : endM);
 
-  if (endMinutes <= startMinutes) {
-    endMinutes += 24 * 60; // Overnight shift support
-  }
+  if (endMinutes <= startMinutes) endMinutes += 24 * 60;
 
   const buckets = [];
   let cursor = startMinutes;
@@ -222,16 +204,15 @@ const generateShiftHourBuckets = (startTimeStr, endTimeStr) => {
   return { buckets, shiftStartMinutes: startMinutes };
 };
 
-// Core Metrics Calculator (combined totals + per-run breakdown)
-const calculateProductionMetrics = (historyToday, shiftStartTime, shiftEndTime) => {
-  if (!historyToday || historyToday.length === 0) {
+const calculateProductionMetrics = (historyData, shiftStartTime, shiftEndTime, cavity = 1) => {
+  if (!historyData || historyData.length === 0) {
     return { totalOutput: 0, hourlyData: [], firstTime: null, runs: [] };
   }
 
-  const firstRecord = historyToday[0];
+  const firstRecord = historyData[0];
   const firstTimeStr = firstRecord?.Time || null;
 
-  const runs = splitIntoRuns(historyToday);
+  const runs = splitIntoRuns(historyData);
   const { buckets, shiftStartMinutes } = generateShiftHourBuckets(shiftStartTime, shiftEndTime);
 
   let totalOutput = 0;
@@ -241,14 +222,17 @@ const calculateProductionMetrics = (historyToday, shiftStartTime, shiftEndTime) 
     const runBuckets = buckets.map((b) => ({ ...b, output: 0 }));
     let runTotalOutput = 0;
 
+    // 🔥 Noise වැළැක්වීම සඳහා අවසන් වරට පිළිගත් අගය (accepted value) භාවිත කිරීම
+    let acceptedPrevCount = Number(run[0].Count);
+
     for (let i = 1; i < run.length; i++) {
-      const prev = Number(run[i - 1].Count);
       const curr = Number(run[i].Count);
+      if (Number.isNaN(curr)) continue;
 
-      if (Number.isNaN(prev) || Number.isNaN(curr)) continue;
+      const delta = (curr - acceptedPrevCount) * cavity;
+      if (delta <= 0) continue;
 
-      const delta = curr - prev;
-      if (delta <= 0) continue; // Safety net: never credit negative/zero output
+      acceptedPrevCount = curr; // අගය නිවැරදිව වැඩි වුනා නම් පමණක් update කරයි
 
       if (!run[i].Time || !run[i].Time.includes(" ")) continue;
 
@@ -261,20 +245,15 @@ const calculateProductionMetrics = (historyToday, shiftStartTime, shiftEndTime) 
       if (Number.isNaN(recH) || Number.isNaN(recM)) continue;
 
       let recordMinsOfDay = recH * 60 + recM;
-
       if (recordMinsOfDay < shiftStartMinutes) {
         recordMinsOfDay += 24 * 60;
       }
 
       const targetBucket = buckets.find((b) => recordMinsOfDay >= b.startMinutes && recordMinsOfDay < b.endMinutes);
-      if (targetBucket) {
-        targetBucket.output += delta;
-      }
+      if (targetBucket) targetBucket.output += delta;
 
       const runTargetBucket = runBuckets.find((b) => recordMinsOfDay >= b.startMinutes && recordMinsOfDay < b.endMinutes);
-      if (runTargetBucket) {
-        runTargetBucket.output += delta;
-      }
+      if (runTargetBucket) runTargetBucket.output += delta;
     }
 
     const firstInRun = run[0];
@@ -305,9 +284,7 @@ const calculateProductionMetrics = (historyToday, shiftStartTime, shiftEndTime) 
 export const getAllData = async (req, res) => {
   try {
     const snapshot = await get(ref(rtdb, "/"));
-    if (!snapshot.exists()) {
-      return res.status(404).json({ success: false, message: "No data found" });
-    }
+    if (!snapshot.exists()) return res.status(404).json({ success: false, message: "No data found" });
     res.status(200).json({ success: true, data: snapshot.val() });
   } catch (error) {
     Notifier.toAdmin("Firebase Error", `Failed to get All Data: ${error.message}`, "CRITICAL_ERROR");
@@ -326,7 +303,7 @@ export const getTotalOutput = async (req, res) => {
     const count = snapshot.exists() ? snapshot.val() : 0;
     return res.status(200).json({ success: true, totalOutput: count });
   } catch (error) {
-    Notifier.toAdmin("Firebase Error", `Failed to fetch Total Output for ${req.params?.machineId}: ${error.message}`, "IOT_ERROR");
+    Notifier.toAdmin("Firebase Error", `Failed to fetch Total Output: ${error.message}`, "IOT_ERROR");
     return res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -335,14 +312,9 @@ export const getMachineData = async (req, res) => {
   const { machineId } = req.params;
   try {
     const snapshot = await get(ref(rtdb, `Machines/${machineId}`));
-    const machineData = snapshot.val();
-
-    if (!machineData) {
-      return res.status(404).json({ success: false, message: "Machine not found" });
-    }
-    res.status(200).json({ success: true, data: machineData });
+    if (!snapshot.val()) return res.status(404).json({ success: false, message: "Machine not found" });
+    res.status(200).json({ success: true, data: snapshot.val() });
   } catch (error) {
-    Notifier.toAdmin("Firebase Error", `Failed to fetch Machine Data [${machineId}]: ${error.message}`, "IOT_ERROR");
     res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -353,24 +325,26 @@ export const getCounterHistory = async (req, res) => {
     const snapshot = await get(ref(rtdb, `${machineId}/CounterHistory`));
     res.status(200).json({ success: true, data: snapshot.val() });
   } catch (error) {
-    Notifier.toAdmin("Firebase Error", `Counter History Fetch Error: ${error.message}`, "IOT_ERROR");
     res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// Target is Line Configuration data -> sourced from MongoDB (source of truth)
 export const getMachineLiveMetrics = async (req, res) => {
   try {
     const { machineId } = req.params;
     const statusSnapshot = await get(ref(rtdb, `Machines/${machineId}/LiveStatus/Count`));
-    const current = statusSnapshot.exists() ? statusSnapshot.val() : 0;
+    const rawCount = statusSnapshot.exists() ? statusSnapshot.val() : 0;
 
+    const injectionMachine = await InjectionMachine.findOne({ machineId }).lean();
     const line = await Line.findOne({ machineId }).lean();
-    const target = line?.dailyTarget || 0;
+
+    const cavity = injectionMachine?.cavities || line?.cavity || 1;
+    const current = rawCount * cavity;
+    const target = injectionMachine?.dailyTarget || line?.dailyTarget || 0;
 
     res.status(200).json({
       success: true,
-      data: { current, target },
+      data: { current, target, cavity },
     });
   } catch (error) {
     Notifier.toAdmin("Firebase Error", `Live Metrics Fetch Error [${req.params?.machineId}]: ${error.message}`, "IOT_ERROR");
@@ -378,17 +352,11 @@ export const getMachineLiveMetrics = async (req, res) => {
   }
 };
 
-// --- (1) Table Data Endpoint ---
 export const getHourlyTableData = async (req, res) => {
   const { machineId } = req.params;
   const { date, shiftStartTime, shiftEndTime } = req.query;
 
-  const selectedDate =
-    date ||
-    (() => {
-      const now = new Date();
-      return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-    })();
+  const logicalDate = getLogicalShiftDate(date, shiftStartTime, shiftEndTime);
 
   try {
     const snapshot = await get(ref(rtdb, `Machines/${machineId}/CounterHistory`));
@@ -396,8 +364,13 @@ export const getHourlyTableData = async (req, res) => {
       return res.status(200).json({ success: true, hourlyData: [], totalOutput: 0, firstTime: null, runs: [] });
     }
 
-    const historyToday = getHistoryForDate(Object.values(snapshot.val()), selectedDate);
-    const metrics = calculateProductionMetrics(historyToday, shiftStartTime, shiftEndTime);
+    const injectionMachine = await InjectionMachine.findOne({ machineId }).lean();
+    const line = await Line.findOne({ machineId }).lean();
+    const cavity = injectionMachine?.cavities || line?.cavity || 1;
+
+    // 🔥 යාවත්කාලීන කළ shift history function එක භාවිතය
+    const historyData = getShiftHistory(Object.values(snapshot.val()), logicalDate, shiftStartTime, shiftEndTime);
+    const metrics = calculateProductionMetrics(historyData, shiftStartTime, shiftEndTime, cavity);
 
     return res.status(200).json({
       success: true,
@@ -405,24 +378,18 @@ export const getHourlyTableData = async (req, res) => {
       firstTime: metrics.firstTime,
       hourlyData: metrics.hourlyData,
       runs: metrics.runs,
+      cavityConfigured: cavity,
     });
   } catch (error) {
-    Notifier.toAdmin("Firebase Error", `Hourly Table Data Error [${machineId}]: ${error.message}`, "CRITICAL_ERROR");
     return res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// --- (2) Chart/Production Data Endpoint ---
 export const getHourlyProductionData = async (req, res) => {
   const { machineId } = req.params;
   const { date, shiftStartTime, shiftEndTime } = req.query;
 
-  const selectedDate =
-    date ||
-    (() => {
-      const now = new Date();
-      return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-    })();
+  const logicalDate = getLogicalShiftDate(date, shiftStartTime, shiftEndTime);
 
   try {
     const snapshot = await get(ref(rtdb, `Machines/${machineId}/CounterHistory`));
@@ -430,8 +397,13 @@ export const getHourlyProductionData = async (req, res) => {
       return res.status(200).json({ success: true, hourlyData: [], totalOutput: 0, firstTime: null, runs: [] });
     }
 
-    const historyToday = getHistoryForDate(Object.values(snapshot.val()), selectedDate);
-    const metrics = calculateProductionMetrics(historyToday, shiftStartTime, shiftEndTime);
+    const injectionMachine = await InjectionMachine.findOne({ machineId }).lean();
+    const line = await Line.findOne({ machineId }).lean();
+    const cavity = injectionMachine?.cavities || line?.cavity || 1;
+
+    // 🔥 යාවත්කාලීන කළ shift history function එක භාවිතය
+    const historyData = getShiftHistory(Object.values(snapshot.val()), logicalDate, shiftStartTime, shiftEndTime);
+    const metrics = calculateProductionMetrics(historyData, shiftStartTime, shiftEndTime, cavity);
 
     return res.status(200).json({
       success: true,
@@ -441,19 +413,19 @@ export const getHourlyProductionData = async (req, res) => {
       runs: metrics.runs,
     });
   } catch (error) {
-    Notifier.toAdmin("Firebase Error", `Hourly Production Data Error [${machineId}]: ${error.message}`, "CRITICAL_ERROR");
     return res.status(500).json({ success: false, message: error.message });
   }
 };
 
-// Assigned machines check -> MongoDB (source of truth for Line assignment)
 export const getFreeCounterMachines = async (req, res) => {
   try {
     const machineSnapshot = await get(ref(rtdb, "Machines"));
     const machines = machineSnapshot.val() || {};
 
     const assignedLines = await Line.find({}, "machineId").lean();
-    const assignedMachines = new Set(assignedLines.map((l) => l.machineId).filter(Boolean));
+    const assignedInjections = await InjectionMachine.find({}, "machineId").lean();
+
+    const assignedMachines = new Set([...assignedLines.map((l) => l.machineId).filter(Boolean), ...assignedInjections.map((im) => im.machineId).filter(Boolean)]);
 
     const freeMachines = Object.entries(machines)
       .filter(([machineId]) => !assignedMachines.has(machineId))
@@ -467,7 +439,6 @@ export const getFreeCounterMachines = async (req, res) => {
     return res.status(200).json({ success: true, count: freeMachines.length, data: freeMachines });
   } catch (error) {
     console.error("Error fetching free counters:", error);
-    Notifier.toAdmin("Firebase Error", `Free Counters Fetch Error: ${error.message}`, "CRITICAL_ERROR");
     res.status(500).json({ success: false, message: "Server Error" });
   }
 };
@@ -476,7 +447,6 @@ export const getFreeCounterMachines = async (req, res) => {
 // 6. GAP ANALYSIS CONTROLLER
 // ============================================================================
 
-// Line configuration (shiftStartTime/shiftEndTime/dailyTarget) -> MongoDB
 export const getCombinedProductionGaps = async (req, res) => {
   const { date, lineId, machineId: queryMachineId } = req.query;
   let targetMachineId = queryMachineId;
@@ -485,45 +455,28 @@ export const getCombinedProductionGaps = async (req, res) => {
   try {
     if (lineId) {
       const line = await Line.findOne({ lineId }).lean();
-      if (!line) {
-        return res.status(404).json({ success: false, message: "Line not found" });
-      }
+      if (!line) return res.status(404).json({ success: false, message: "Line not found" });
       lineData = line;
       targetMachineId = line.machineId;
 
-      if (!targetMachineId) {
-        return res.status(404).json({ success: false, message: "No machine assigned to this line" });
-      }
+      if (!targetMachineId) return res.status(404).json({ success: false, message: "No machine assigned" });
     }
 
-    if (!targetMachineId) {
-      return res.status(400).json({ success: false, message: "Please provide either lineId or machineId" });
-    }
+    if (!targetMachineId) return res.status(400).json({ success: false, message: "Please provide either lineId or machineId" });
 
     const historySnapshot = await get(ref(rtdb, `Machines/${targetMachineId}/CounterHistory`));
+    if (!historySnapshot.exists()) return res.status(404).json({ success: false, message: "No CounterHistory found" });
 
-    if (!historySnapshot.exists()) {
-      return res.status(404).json({ success: false, message: "No CounterHistory found" });
-    }
+    const injectionMachine = await InjectionMachine.findOne({ machineId: targetMachineId }).lean();
+    const cavity = injectionMachine?.cavities || lineData?.cavity || 1;
 
-    const startTime = lineData.shiftStartTime || "08:30";
-    const endTime = lineData.shiftEndTime || "20:30";
-    const dailyTarget = Number(lineData.dailyTarget || 0);
+    const startTime = lineData.shiftStartTime || injectionMachine?.shiftStartTime || "08:30";
+    const endTime = lineData.shiftEndTime || injectionMachine?.shiftEndTime || "20:30";
+    const dailyTarget = Number(lineData.dailyTarget || injectionMachine?.dailyTarget || 0);
 
-    const selectedDate =
-      date ||
-      (() => {
-        const now = new Date();
-        return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-      })();
-
-    const history = Object.values(historySnapshot.val())
-      .filter((item) => {
-        if (!item.Time) return false;
-        const itemDate = item.Time.split(" ")[0].replace(/\//g, "-");
-        return itemDate === selectedDate;
-      })
-      .sort((a, b) => a.timestamp - b.timestamp);
+    // 🔥 Gap Chart එක සඳහාද නිවැරදි shift date එක භාවිතා කිරීම
+    const logicalDate = getLogicalShiftDate(date, startTime, endTime);
+    const history = getShiftHistory(Object.values(historySnapshot.val()), logicalDate, startTime, endTime);
 
     const gapData = [];
 
@@ -543,7 +496,7 @@ export const getCombinedProductionGaps = async (req, res) => {
 
         if (gapSeconds >= 0) {
           gapData.push({
-            count: current.Count,
+            count: current.Count * cavity,
             time: current.Time.split(" ")[1],
             gapSeconds: Math.round(gapSeconds),
           });
@@ -567,7 +520,7 @@ export const getCombinedProductionGaps = async (req, res) => {
       success: true,
       lineId: lineId || null,
       machineId: targetMachineId,
-      date: selectedDate,
+      date: logicalDate,
       startTime,
       endTime,
       dailyTarget,
@@ -575,7 +528,6 @@ export const getCombinedProductionGaps = async (req, res) => {
       data: gapData,
     });
   } catch (error) {
-    Notifier.toAdmin("Firebase Error", `Production Gaps Calc Error: ${error.message}`, "CRITICAL_ERROR");
     return res.status(500).json({ success: false, message: error.message });
   }
 };
@@ -584,26 +536,20 @@ export const getCombinedProductionGaps = async (req, res) => {
 // 7. LIVE DATA & HEALTH ROUTES
 // ============================================================================
 
-// Line details (target/product/shift times/machineId) -> MongoDB.
-// Firebase is used ONLY for the real-time Count.
 export const getLiveDataByLineId = async (req, res) => {
   try {
     const { lineId } = req.params;
-
     const line = await Line.findOne({ lineId }).lean();
-
-    if (!line) {
-      return res.status(404).json({ success: false, message: "Line not found" });
-    }
+    if (!line) return res.status(404).json({ success: false, message: "Line not found" });
 
     const machineId = line.machineId;
-
-    if (!machineId) {
-      return res.status(404).json({ success: false, message: "No machine assigned to this line" });
-    }
+    if (!machineId) return res.status(404).json({ success: false, message: "No machine assigned to this line" });
 
     const statusSnapshot = await get(ref(rtdb, `Machines/${machineId}/LiveStatus/Count`));
-    const count = statusSnapshot.exists() ? statusSnapshot.val() : 0;
+    const rawCount = statusSnapshot.exists() ? statusSnapshot.val() : 0;
+
+    const cavity = line.cavity || 1;
+    const count = rawCount * cavity;
 
     return res.status(200).json({
       success: true,
@@ -615,33 +561,22 @@ export const getLiveDataByLineId = async (req, res) => {
       machineId,
     });
   } catch (error) {
-    console.error("Error fetching line live data:", error);
-    Notifier.toAdmin("Firebase Error", `Live Data Error [${req.params?.lineId}]: ${error.message}`, "IOT_ERROR");
     res.status(500).json({ success: false, message: "Server Error" });
   }
 };
 
-// ✅ FIX: Now also returns each machine's LIVE COUNT (not just Health).
-// The Superuser/Supervisor dashboards need this to fill in totalProductCount,
-// since previously only Health was returned and Count was never merged in,
-// causing "Total Products", the Output bars, and per-line progress to show 0.
 export const getMachineStatus = async (req, res) => {
   try {
     const machinesRef = ref(rtdb, "Machines");
     const snapshot = await get(machinesRef);
 
-    if (!snapshot.exists()) {
-      return res.status(200).json({ success: true, data: [] });
-    }
+    if (!snapshot.exists()) return res.status(200).json({ success: true, data: [] });
 
     const machines = snapshot.val();
     const statusData = [];
 
     for (const [machineId, machineData] of Object.entries(machines)) {
       const liveCount = Number(machineData?.LiveStatus?.Count ?? 0);
-
-      // Previously this skipped machines with no Health node entirely,
-      // meaning their live count never reached the frontend either.
       statusData.push({
         machineId,
         ...(machineData.Health || {}),
@@ -651,8 +586,53 @@ export const getMachineStatus = async (req, res) => {
 
     return res.status(200).json({ success: true, data: statusData });
   } catch (error) {
-    console.error("Error fetching machine status:", error);
-    Notifier.toAdmin("Firebase Error", `Machine Health Status Error: ${error.message}`, "IOT_ERROR");
     return res.status(500).json({ success: false, message: "Server Error" });
+  }
+};
+
+export const deleteOldCounterHistory = async (req, res) => {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const machinesSnapshot = await get(ref(rtdb, "Machines"));
+    if (!machinesSnapshot.exists()) return res.status(404).json({ success: false, message: "No machines found" });
+
+    const machines = machinesSnapshot.val();
+    let totalDeleted = 0;
+
+    for (const machineId of Object.keys(machines)) {
+      const historyRef = ref(rtdb, `Machines/${machineId}/CounterHistory`);
+      const historySnapshot = await get(historyRef);
+
+      if (!historySnapshot.exists()) continue;
+
+      const history = historySnapshot.val();
+      const updates = {};
+
+      for (const [key, item] of Object.entries(history)) {
+        if (!item.Time) continue;
+        const recordDate = new Date(item.Time.replace(/\//g, "-"));
+        recordDate.setHours(0, 0, 0, 0);
+
+        if (recordDate < today) {
+          updates[key] = null;
+          totalDeleted++;
+        }
+      }
+
+      if (Object.keys(updates).length > 0) {
+        await update(historyRef, updates);
+        console.log(`✅ ${machineId}: Deleted ${Object.keys(updates).length} records`);
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      deletedRecords: totalDeleted,
+      message: "Old CounterHistory deleted successfully.",
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
   }
 };

@@ -1,5 +1,5 @@
 import Mould from "../models/Mould.js";
-import InjectionMachine from "../models/InjectionMachine.js";
+import { InjectionMachine } from "../models/InjectionMachine.js";
 
 export const createMould = async (req, res) => {
   try {

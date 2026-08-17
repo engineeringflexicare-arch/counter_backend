@@ -1,43 +1,80 @@
+// models/InjectionMachine.js
 import mongoose from "mongoose";
 
 const injectionMachineSchema = new mongoose.Schema(
   {
-    machineCode: {
+    injectionMachineNumber: {
       type: String,
-      required: [true, "Machine code is required"],
+      required: true,
       unique: true,
       trim: true,
-      uppercase: true, // අකුරු capital වලින් save වීමට
     },
-    tonnage: {
+    mouldNumber: {
+      type: String,
+      default: "",
+    },
+    cavities: {
       type: Number,
-      required: [true, "Tonnage is required"],
+      default: 1,
     },
-    status: {
+    machineId: {
+      type: String, // ESP32 Device ID
+      default: "",
+    },
+    productCode: {
       type: String,
-      enum: ["Active", "Inactive", "Maintenance"],
-      default: "Active",
+      default: "",
     },
-    location: {
+    dailyTarget: {
+      type: Number,
+      default: 0,
+    },
+    hourlyTarget: {
+      type: Number,
+      default: 0,
+    },
+    plannedMembers: {
+      type: Number,
+      default: 0,
+    },
+    totalProductCount: {
+      type: Number,
+      default: 0,
+    },
+    shift: {
       type: String,
-      required: [true, "Location is required"],
-      trim: true,
+      default: "",
     },
-    brand: {
+    supervisor: {
       type: String,
-      trim: true,
+      default: "",
     },
-    // Soft delete සඳහා (කලින් controller එකේ භාවිත කළ පරිදි)
-    isDeleted: {
-      type: Boolean,
-      default: false,
+    shiftStartTime: {
+      type: String,
+      default: "",
+    },
+    shiftEndTime: {
+      type: String,
+      default: "",
+    },
+    floor: {
+      type: String,
+      default: "",
+    },
+    plannedDate: {
+      type: String,
+      default: "",
+    },
+    assignedBy: {
+      type: String,
+      default: "System",
+    },
+    updatedBy: {
+      type: String,
+      default: "System",
     },
   },
-  {
-    timestamps: true, // createdAt සහ updatedAt ස්වයංක්‍රීයව සෑදීමට
-  },
+  { timestamps: true },
 );
 
-const InjectionMachine = mongoose.model("InjectionMachine", injectionMachineSchema);
-
-export default InjectionMachine;
+export const InjectionMachine = mongoose.model("InjectionMachine", injectionMachineSchema);

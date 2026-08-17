@@ -11,6 +11,7 @@ import {
   getFreeCounterMachines,
   getTotalOutput,
   getMachineStatus,
+  deleteOldCounterHistory,
 } from "../controllers/Esp32DataController.js";
 import { verifyToken } from "../middleware/authMiddleware.js";
 
@@ -44,6 +45,8 @@ router.get("/:machineId/total-output", getTotalOutput);
 router.get("/production-gaps", getCombinedProductionGaps);
 router.get("/live-line/:lineId", getLiveDataByLineId);
 router.get("/line-live-data/:lineId", getLiveDataByLineId); // Note: You have two endpoints for the same controller
+
+router.delete("/history/delete-old", deleteOldCounterHistory);
 
 // Only ONE default export!
 export default router;

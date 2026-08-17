@@ -22,7 +22,11 @@ import orderRoutes from "./routers/orderRoutes.js";
 import planRouter from "./routers/planRoutes.js";
 import inventoryRoutes from "./routers/inventoryRoutes.js";
 import capacityRoutes from "./routers/capacityRoutes.js";
-import injectionRoutes from "./routers/injectionRoutes.js";
+import injectionRoutes from "./routers/injectionMachineRoutes.js";
+import salesOrderRoutes from "./routers/salesOrderRoutes.js";
+import machineCalendarRoutes from "./routers/machineCalendarRoutes.js";
+import toolCalendarRoutes from "./routers/toolCalendarRoutes.js";
+import productionPlanningRoutes from "./routers/productionPlanningRoutes.js";
 
 import { startHeartbeatService } from "./services/heartbeatService.js";
 import MouldsRouter from "./routers/MouldRoutes.js";
@@ -122,13 +126,18 @@ app.use("/api/users", UserRouter);
 app.use("/api/auth", ForgotPasswordRouter);
 app.use("/api/superuser", SuperuserRouter);
 
-// අලුතින් එක් කළ MES Endpoints
+// අලුතින් එක් කළ MES Endpoint
+app.use("/api/injection-machines", injectionRoutes);
 app.use("/api/v1/orders", orderRoutes);
 app.use("/api/v1/production-plans", planRouter);
 app.use("/api/v1/inventory", inventoryRoutes);
 app.use("/api/v1/capacity-planning", capacityRoutes);
-app.use("/api/v1/injection-plans", injectionRoutes);
+
 app.use("/api/v1/moulds", MouldsRouter);
+app.use("/api/v1/sales-orders", salesOrderRoutes);
+app.use("/api/v1/machine-calendar", machineCalendarRoutes);
+app.use("/api/v1/tool-calendar", toolCalendarRoutes);
+app.use("/api/v1/production-planning", productionPlanningRoutes);
 // ==========================================
 // 404 Route Not Found
 // ==========================================
