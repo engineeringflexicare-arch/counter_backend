@@ -32,10 +32,26 @@ router.patch("/users/block/:id", blockUser);
 router.patch("/users/unblock/:id", unblockUser);
 router.delete("/users/:id", deleteUser);
 
+import { body, validationResult } from "express-validator";
+
+const validate = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ success: false, errors: errors.array() });
+  next();
+};
+
 // 3. Line & Machine Management
 router.get("/lines", getAllLines);
 router.get("/machines/available", getAvailableMachines);
-router.post("/lines/assign", assignLine);
+router.post(
+  "/lines/assign",
+  [
+    body("lineId").notEmpty().withMessage("Line ID is required"),
+    body("machineId").notEmpty().withMessage("Machine ID is required"),
+  ],
+  validate,
+  assignLine
+);
 router.patch("/lines/remove", removeAssignment);
 router.patch("/lines/update", updateLineDetails);
 

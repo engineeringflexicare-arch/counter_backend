@@ -4,13 +4,24 @@ import jwt from "jsonwebtoken";
 const JWT_SECRET = process.env.JWT_SECRET;
 
 export const verifyToken = (req, res, next) => {
-  const authHeader = req.headers.authorization;
+  let token = null;
 
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({ success: false, message: "Unauthorized: No token provided" });
+  // 1. Try extracting from HttpOnly cookie manually (since cookie-parser is not installed)
+  if (req.headers.cookie) {
+    const cookies = Object.fromEntries(req.headers.cookie.split(";").map(c => c.trim().split("=")));
+    if (cookies.token) {
+      token = cookies.token;
+    }
   }
 
-  const token = authHeader.split(" ")[1];
+  // 2. Fallback to Authorization header (Backward compatibility)
+  if (!token && req.headers.authorization && req.headers.authorization.startsWith("Bearer ")) {
+    token = req.headers.authorization.split(" ")[1];
+  }
+
+  if (!token) {
+    return res.status(401).json({ success: false, message: "Unauthorized: No token provided" });
+  }
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);

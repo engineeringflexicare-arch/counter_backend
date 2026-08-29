@@ -12,6 +12,7 @@ import {
   getTotalOutput,
   getMachineStatus,
   deleteOldCounterHistory,
+  migrateDataToMongo,
 } from "../controllers/Esp32DataController.js";
 import { verifyToken } from "../middleware/authMiddleware.js";
 
@@ -33,7 +34,7 @@ router.get("/free-counters", getFreeCounterMachines); // Note: You have two endp
 // Machine Data & Metrics Routes
 // ====================================================
 router.get("/machine/:machineId", getMachineData);
-router.get("/history/:machineId", getCounterHistory);
+router.get("/CounterHistory/:machineId", getCounterHistory);
 router.get("/metrics/:machineId", getMachineLiveMetrics);
 router.get("/hourly-production/:machineId", getHourlyProductionData);
 router.get("/hourly-table/:machineId", getHourlyTableData);
@@ -45,6 +46,8 @@ router.get("/:machineId/total-output", getTotalOutput);
 router.get("/production-gaps", getCombinedProductionGaps);
 router.get("/live-line/:lineId", getLiveDataByLineId);
 router.get("/line-live-data/:lineId", getLiveDataByLineId); // Note: You have two endpoints for the same controller
+
+router.get("/migrate-to-mongo", migrateDataToMongo); // This route is for data migration from MySQL to MongoDB
 
 router.delete("/history/delete-old", deleteOldCounterHistory);
 

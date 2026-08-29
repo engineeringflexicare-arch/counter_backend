@@ -1,8 +1,7 @@
-// controllers/injectionMachineController.js
 import { get, ref } from "firebase/database";
 import { rtdb } from "../database.js";
 import { InjectionMachine } from "../models/InjectionMachine.js";
-// import { InjectionMachineHistory } from "../models/InjectionMachineHistory.js"; // මෙයත් අවශ්‍ය නම් හදාගන්න
+import { InjectionMachineHistory } from "../models/InjectionMachineHistory.js";
 import { AuditLog } from "../models/AuditLog.js";
 import { Notification } from "../models/Notification.js";
 import Configuration from "../models/Configuration.js";
@@ -98,13 +97,14 @@ export const getAvailableESPDevices = async (req, res) => {
 };
 
 // ============================================================================
-// 4. ASSIGN INJECTION MACHINE
+// 4. ASSIGN INJECTION MACHINE (මෙයටත් History එක එකතු කරන ලදී)
 // ============================================================================
 export const assignInjectionMachine = async (req, res) => {
   if (!canUpdateMachine(req, res)) return;
 
   try {
-    const { injectionMachineNumber, mouldNumber, cavities, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, supervisor, shiftStartTime, shiftEndTime, floor } = req.body;
+    const { injectionMachineNumber, mouldNumber, cavities, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, supervisor, shiftStartTime, shiftEndTime, floor, plannedDate } =
+      req.body;
     const userName = req.user?.name || "System";
 
     if (!injectionMachineNumber || !machineId || !mouldNumber) {
@@ -141,6 +141,14 @@ export const assignInjectionMachine = async (req, res) => {
     }
 
     await injectionMachine.save();
+
+    // 🔥 Assign / Re-assign කරන විටත් History එක MongoDB හි Save වීම සඳහා
+    const historyDate = plannedDate || new Date().toISOString().split("T")[0];
+    const machineObj = injectionMachine.toObject();
+    delete machineObj._id;
+    delete machineObj.__v;
+
+    await InjectionMachineHistory.findOneAndUpdate({ injectionMachineNumber, historyDate }, { ...machineObj, historyDate }, { upsert: true, new: true });
 
     await AuditLog.create({
       action,
@@ -254,6 +262,14 @@ export const updateInjectionMachineDetails = async (req, res) => {
     });
 
     await machine.save();
+
+    // 🔥 දෛනික History එක Save කිරීම (වැඩිදියුණු කරන ලදී)
+    const historyDate = plannedDate || new Date().toISOString().split("T")[0];
+    const machineObj = machine.toObject();
+    delete machineObj._id;
+    delete machineObj.__v;
+
+    await InjectionMachineHistory.findOneAndUpdate({ injectionMachineNumber, historyDate }, { ...machineObj, historyDate }, { upsert: true, new: true });
 
     await AuditLog.create({
       action: "INJECTION_MACHINE_UPDATE",

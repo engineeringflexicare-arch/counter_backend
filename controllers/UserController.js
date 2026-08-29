@@ -223,9 +223,18 @@ export const loginUser = async (req, res) => {
 
     const token = jwt.sign({ id: user._id, role: user.role, name: user.FirstName }, JWT_SECRET, { expiresIn: "8h" });
 
+    // Set HttpOnly cookie for web clients
+    res.cookie("token", token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "strict",
+      maxAge: 8 * 60 * 60 * 1000, // 8 hours
+      path: "/",
+    });
+
     return res.status(200).json({
       success: true,
-      token,
+      token, // Kept for backward compatibility with mobile apps
       role: user.role,
       name: user.FirstName,
       user: { id: user._id, employeeId: user.EmployeeId, firstName: user.FirstName, lastName: user.LastName, email: user.email, role: user.role, department: user.department },

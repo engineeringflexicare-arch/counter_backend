@@ -1,6 +1,6 @@
 import dotenv from "dotenv";
 import mongoose from "mongoose";
-import xlsx from "xlsx";
+import ExcelJS from "exceljs";
 import DailyProductionHistory from "../models/DailyProductionHistory.js";
 
 dotenv.config();
@@ -12,13 +12,51 @@ if (!filePath) {
   process.exit(1);
 }
 
+function normalizeRowsFromWorksheet(worksheet) {
+  const startRowIndex = 4;
+  const headerRow = worksheet.getRow(startRowIndex);
+  const headers = [];
+
+  headerRow.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+    const value = cell.value == null ? `__empty_${colNumber}` : String(cell.value).trim();
+    headers[colNumber - 1] = value;
+  });
+
+  const rows = [];
+
+  for (let rowIndex = startRowIndex + 1; rowIndex <= worksheet.rowCount; rowIndex += 1) {
+    const row = worksheet.getRow(rowIndex);
+    const record = {};
+    let hasContent = false;
+
+    headers.forEach((header, headerIndex) => {
+      if (!header || header.startsWith("__empty_")) {
+        return;
+      }
+
+      const cellValue = row.getCell(headerIndex + 1).value;
+      if (cellValue !== null && cellValue !== undefined && cellValue !== "") {
+        hasContent = true;
+      }
+      record[header] = cellValue;
+    });
+
+    if (hasContent) {
+      rows.push(record);
+    }
+  }
+
+  return rows;
+}
+
 async function run() {
   await mongoose.connect(process.env.MONGO_URI);
   console.log("Connected to MongoDB");
 
-  const workbook = xlsx.readFile(filePath);
-  const sheet = workbook.Sheets[workbook.SheetNames[0]];
-  const rows = xlsx.utils.sheet_to_json(sheet, { range: 3, defval: null });
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.readFile(filePath);
+  const worksheet = workbook.worksheets[0];
+  const rows = normalizeRowsFromWorksheet(worksheet);
 
   console.log(`Read ${rows.length} rows. Importing in batches...`);
 
