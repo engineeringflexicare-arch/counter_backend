@@ -1,17 +1,17 @@
 {
-  "name": "counter_bsckend",
+  "name": "counter_backend",
   "version": "1.0.0",
-  "description": "",
+  "description": "Counter Production Monitoring Backend",
   "main": "index.js",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "nodemon index.js",
+    "dev": "nodemon index.js",
+    "start": "node index.js",
     "import-history": "node scripts/importDailyProductionHistory.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "module",
   "dependencies": {
     "bcrypt": "^6.0.0",
     "bcryptjs": "^3.0.3",
@@ -25,11 +25,18 @@
     "jsonwebtoken": "^9.0.3",
     "mongodb": "^7.3.0",
     "mongoose": "^9.7.0",
-    "node": "^26.3.0",
     "node-cache": "^5.1.2",
     "node-cron": "^4.4.1",
-    "nodemailer": "^9.0.0",
+    "nodemailer": "^9.0.5",
     "nodemon": "^3.1.14",
-    "xlsx": "^0.18.3"
+    "exceljs": "^4.1.1"
+  },
+  "allowScripts": {
+    "bcrypt@6.0.0": true,
+    "@firebase/util@1.15.3": true,
+    "protobufjs@7.6.5": true
+  },
+  "overrides": {
+    "uuid": "^11.1.1"
   }
 }

@@ -9,7 +9,7 @@ import { Notifier } from "../utils/Notifier.js";
 import jwt from "jsonwebtoken";
 
 // ============================================================================
-// Permission Helpers (✅ BUG FIX: Robust Role & Token Checking)
+// Permission Helpers
 // ============================================================================
 
 const getAuthUser = (req) => {
@@ -29,7 +29,6 @@ const canEdit = (req, res) => {
 
   if (user) {
     const roleStr = String(user.role || user.userRole || user.type || "").toLowerCase();
-
     if (["admin", "superuser"].includes(roleStr)) {
       req.user = user;
       return true;
@@ -48,7 +47,6 @@ const canUpdateLine = (req, res) => {
 
   if (user) {
     const roleStr = String(user.role || user.userRole || user.type || "").toLowerCase();
-
     if (["admin", "superuser", "supervisor"].includes(roleStr)) {
       req.user = user;
       return true;
@@ -115,7 +113,7 @@ export const assignLine = async (req, res) => {
   if (!canUpdateLine(req, res)) return;
 
   try {
-    const { lineId, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, supervisor, shiftStartTime, shiftEndTime, floor } = req.body;
+    const { lineId, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, supervisor, shiftStartTime, shiftEndTime, floor, cavity } = req.body;
     const userName = req.user?.name || "System";
 
     if (!lineId || !machineId) {
@@ -133,6 +131,7 @@ export const assignLine = async (req, res) => {
       shiftStartTime: shiftStartTime || "",
       shiftEndTime: shiftEndTime || "",
       floor: floor || "",
+      cavity: Number(cavity) || 1, // 🔥 එකතු කර ඇත
       assignedBy: userName,
       updatedBy: userName,
     };
@@ -172,7 +171,7 @@ export const assignLine = async (req, res) => {
 };
 
 // ============================================================================
-// 5. REMOVE ASSIGNMENT (✅ FIXED: findOneAndUpdate + debug logs + trim/case-safe match)
+// 5. REMOVE ASSIGNMENT
 // ============================================================================
 export const removeAssignment = async (req, res) => {
   if (!canUpdateLine(req, res)) return;
@@ -189,7 +188,6 @@ export const removeAssignment = async (req, res) => {
 
     const cleanLineId = lineId.toString().trim();
 
-    // Case-insensitive, whitespace-safe lookup
     const line = await Line.findOne({
       lineId: { $regex: new RegExp(`^${cleanLineId}$`, "i") },
     });
@@ -216,9 +214,9 @@ export const removeAssignment = async (req, res) => {
       shiftStartTime: "",
       shiftEndTime: "",
       floor: "",
+      cavity: 1, // 🔥 Default අගයට ගෙන ඒම
     };
 
-    // ✅ Use findOneAndUpdate with $set instead of .save() — more reliable for clearing fields
     const updatedLine = await Line.findOneAndUpdate({ _id: line._id }, { $set: clearedFields }, { new: true });
 
     console.log("✅ [REMOVE] Line updated in MongoDB:", updatedLine);
@@ -244,13 +242,13 @@ export const removeAssignment = async (req, res) => {
 };
 
 // ============================================================================
-// 6. UPDATE LINE DETAILS (Supervisor ටත් අදාළ වේ)
+// 6. UPDATE LINE DETAILS
 // ============================================================================
 export const updateLineDetails = async (req, res) => {
   if (!canUpdateLine(req, res)) return;
 
   try {
-    const { lineId, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, floor, supervisor, plannedDate, shiftStartTime, shiftEndTime } = req.body;
+    const { lineId, machineId, productCode, dailyTarget, hourlyTarget, teamMembers, shift, floor, supervisor, plannedDate, shiftStartTime, shiftEndTime, cavity } = req.body;
 
     const line = await Line.findOne({ lineId });
     if (!line) return res.status(404).json({ success: false, message: "Line not found" });
@@ -269,6 +267,7 @@ export const updateLineDetails = async (req, res) => {
       plannedDate: plannedDate ?? line.plannedDate,
       shiftStartTime: shiftStartTime ?? line.shiftStartTime,
       shiftEndTime: shiftEndTime ?? line.shiftEndTime,
+      cavity: cavity ? Number(cavity) : line.cavity, // 🔥 Cavity යාවත්කාලීන කිරීම
     });
 
     await line.save();
@@ -279,6 +278,7 @@ export const updateLineDetails = async (req, res) => {
     delete lineObj._id;
     delete lineObj.__v;
 
+    // 🔥 දෛනික History එක Save කිරීම
     if (LineHistory) {
       await LineHistory.findOneAndUpdate({ lineId, historyDate }, { ...lineObj, historyDate }, { upsert: true, new: true });
     }
@@ -323,11 +323,11 @@ export const getLiveDataByLineId = async (req, res) => {
     }
 
     const statusSnapshot = await get(ref(rtdb, `Machines/${machineId}/LiveStatus/Count`));
-    const count = statusSnapshot.exists() ? statusSnapshot.val() : 0;
+    const rawCount = statusSnapshot.exists() ? statusSnapshot.val() : 0;
 
     return res.status(200).json({
       success: true,
-      count,
+      count: rawCount * (lineData.cavity || 1), // 🔥 Cavity ගුණ කිරීම
       target: lineData.dailyTarget || 0,
       productCode: lineData.productCode || "—",
       startTime: lineData.shiftStartTime || "—",
@@ -348,12 +348,22 @@ export const getCombinedProductionGaps = async (req, res) => {
   let lineData = {};
 
   try {
+    const defaultLogicalDate = date || new Date().toISOString().split("T")[0];
+
     if (lineId) {
-      const lineSnapshot = await get(ref(rtdb, `Lines/${lineId}`));
-      if (!lineSnapshot.exists()) {
+      // 🔥 අතීත දිනයක් නම් පළමුව History පරීක්ෂා කිරීම (Optimized)
+      const now = new Date().toISOString().split("T")[0];
+
+      if (defaultLogicalDate === now) {
+        lineData = await Line.findOne({ lineId }).lean();
+      } else {
+        lineData = await LineHistory.findOne({ lineId, historyDate: defaultLogicalDate }).lean();
+        if (!lineData) lineData = await Line.findOne({ lineId }).lean();
+      }
+
+      if (!lineData) {
         return res.status(404).json({ success: false, message: "Line not found" });
       }
-      lineData = lineSnapshot.val();
       targetMachineId = lineData.machineId;
 
       if (!targetMachineId) {
@@ -377,13 +387,9 @@ export const getCombinedProductionGaps = async (req, res) => {
     const startTime = lineData.shiftStartTime || machineData.productionStartTime || "08:30";
     const endTime = lineData.shiftEndTime || machineData.productionEndTime || "20:30";
     const dailyTarget = Number(lineData.dailyTarget || machineData.dailyTarget || 0);
+    const cavity = lineData.cavity || 1; // 🔥 History එකෙන් ගත් Cavity එක
 
-    const selectedDate =
-      date ||
-      (() => {
-        const now = new Date();
-        return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-      })();
+    const selectedDate = defaultLogicalDate;
 
     const history = Object.values(historySnapshot.val())
       .filter((item) => {
@@ -411,7 +417,7 @@ export const getCombinedProductionGaps = async (req, res) => {
 
         if (gapSeconds >= 0) {
           gapData.push({
-            count: current.Count,
+            count: current.Count * cavity, // 🔥 Cavity ගුණ කිරීම
             time: current.Time.split(" ")[1],
             gapSeconds: Math.round(gapSeconds),
           });
