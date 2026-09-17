@@ -1,4 +1,4 @@
-import { get, ref, remove, update } from "firebase/database";
+import { get, ref, remove, update, query, orderByChild, startAt, endAt } from "firebase/database";
 import { rtdb } from "../database.js";
 import jwt from "jsonwebtoken";
 import { Notifier } from "../utils/Notifier.js";
@@ -7,6 +7,10 @@ import { LineHistory } from "../models/LineHistory.js";
 import { InjectionMachine } from "../models/InjectionMachine.js";
 import { InjectionMachineHistory } from "../models/InjectionMachineHistory.js";
 import { CounterHistoryArchive } from "../models/CounterHistoryArchive.js";
+import { Line as LineModel } from "../models/Line.js";
+import { InjectionMachine as InjectionMachineModel } from "../models/InjectionMachine.js";
+import { Counter } from "../models/Machine.js";
+import { cacheGet, cacheSet, cached } from "../utils/memoryCache.js";
 
 // ============================================================================
 // 1. AUTH HELPER
@@ -236,64 +240,101 @@ const calculateProductionMetrics = (historyData, shiftStartTime, shiftEndTime, c
 };
 
 const getOptimizedConfig = async (machineId, lineId, logicalDate) => {
-  const now = new Date();
-  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-  const isToday = logicalDate === today;
+  const cacheKey = `config:${machineId || ""}:${lineId || ""}:${logicalDate || ""}`;
+  return cached(cacheKey, 30_000, async () => {
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const isToday = logicalDate === today;
+    const selectFields = "cavities cavity dailyTarget shiftStartTime shiftEndTime machineId";
+    let injectionMachine = null;
+    let line = null;
 
-  const selectFields = "cavities cavity dailyTarget shiftStartTime shiftEndTime machineId";
-  let injectionMachine = null;
-  let line = null;
-
-  if (isToday) {
-    if (machineId) {
-      injectionMachine = await InjectionMachine.findOne({ machineId }).select(selectFields).lean();
-      if (!injectionMachine) line = await Line.findOne({ machineId }).select(selectFields).lean();
-    } else if (lineId) {
-      line = await Line.findOne({ lineId }).select(selectFields).lean();
-      if (line?.machineId) {
-        injectionMachine = await InjectionMachine.findOne({ machineId: line.machineId }).select(selectFields).lean();
+    if (isToday) {
+      if (machineId) {
+        injectionMachine = await InjectionMachine.findOne({ machineId }).select(selectFields).lean();
+        if (!injectionMachine) line = await Line.findOne({ machineId }).select(selectFields).lean();
+      } else if (lineId) {
+        line = await Line.findOne({ lineId }).select(selectFields).lean();
+        if (line?.machineId) {
+          injectionMachine = await InjectionMachine.findOne({ machineId: line.machineId }).select(selectFields).lean();
+        }
+      }
+    } else {
+      if (machineId) {
+        injectionMachine = await InjectionMachineHistory.findOne({ machineId, historyDate: logicalDate }).select(selectFields).lean();
+        if (!injectionMachine) injectionMachine = await InjectionMachine.findOne({ machineId }).select(selectFields).lean();
+        line = await LineHistory.findOne({ machineId, historyDate: logicalDate }).select(selectFields).lean();
+        if (!line) line = await Line.findOne({ machineId }).select(selectFields).lean();
+      } else if (lineId) {
+        line = await LineHistory.findOne({ lineId, historyDate: logicalDate }).select(selectFields).lean();
+        if (!line) line = await Line.findOne({ lineId }).select(selectFields).lean();
+        if (line?.machineId) {
+          injectionMachine = await InjectionMachineHistory.findOne({ machineId: line.machineId, historyDate: logicalDate }).select(selectFields).lean();
+          if (!injectionMachine) injectionMachine = await InjectionMachine.findOne({ machineId: line.machineId }).select(selectFields).lean();
+        }
       }
     }
-  } else {
-    if (machineId) {
-      injectionMachine = await InjectionMachineHistory.findOne({ machineId, historyDate: logicalDate }).select(selectFields).lean();
-      if (!injectionMachine) injectionMachine = await InjectionMachine.findOne({ machineId }).select(selectFields).lean();
+    return { injectionMachine, line };
+  });
+};
 
-      line = await LineHistory.findOne({ machineId, historyDate: logicalDate }).select(selectFields).lean();
-      if (!line) line = await Line.findOne({ machineId }).select(selectFields).lean();
-    } else if (lineId) {
-      line = await LineHistory.findOne({ lineId, historyDate: logicalDate }).select(selectFields).lean();
-      if (!line) line = await Line.findOne({ lineId }).select(selectFields).lean();
+// ============================================================================
+// 3.1 MEMORY-SAFE FIREBASE HELPERS
+// ============================================================================
 
-      if (line?.machineId) {
-        injectionMachine = await InjectionMachineHistory.findOne({ machineId: line.machineId, historyDate: logicalDate }).select(selectFields).lean();
-        if (!injectionMachine) injectionMachine = await InjectionMachine.findOne({ machineId: line.machineId }).select(selectFields).lean();
-      }
-    }
-  }
+// IMPORTANT: Never read Machines/ as a whole. CounterHistory can grow very large.
+// Machine IDs are discovered from the application's MongoDB registry instead.
+const getKnownMachineIds = async () => cached("machine-ids", 15_000, async () => {
+  const [lineIds, injectionIds, counterIds] = await Promise.all([
+    LineModel.distinct("machineId"),
+    InjectionMachineModel.distinct("machineId"),
+    Counter.distinct("counterId"),
+  ]);
+  return [...new Set([...lineIds, ...injectionIds, ...counterIds].filter(Boolean).map(String))];
+});
 
-  return { injectionMachine, line };
+const getMachineSnapshot = async (machineId) => {
+  if (!machineId) return null;
+  return cached(`machine-snapshot:${machineId}`, 2_500, async () => {
+    const [healthSnapshot, liveSnapshot] = await Promise.all([
+      get(ref(rtdb, `Machines/${machineId}/Health`)),
+      get(ref(rtdb, `Machines/${machineId}/LiveStatus`)),
+    ]);
+    if (!healthSnapshot.exists() && !liveSnapshot.exists()) return null;
+    return {
+      Health: healthSnapshot.exists() ? healthSnapshot.val() : {},
+      LiveStatus: liveSnapshot.exists() ? liveSnapshot.val() : {},
+    };
+  });
+};
+
+const getDateBoundsSeconds = (dateStr) => {
+  const start = new Date(`${dateStr}T00:00:00`);
+  const end = new Date(`${dateStr}T23:59:59.999`);
+  return {
+    start: Math.floor(start.getTime() / 1000),
+    end: Math.floor(end.getTime() / 1000),
+  };
 };
 
 // ============================================================================
 // 3.1 NEW: ARCHIVE-AWARE COUNTER HISTORY FETCHER
 // ============================================================================
 const getCounterHistoryForDate = async (machineId, logicalDate) => {
-  if (!machineId) return [];
+  if (!machineId || !logicalDate) return [];
+  // Only deduplicate concurrent reads. Do NOT retain raw history in the cache:
+  // a day's history can itself be large and must be released after processing.
+  return cached(`history-load:${machineId}:${logicalDate}`, 1_500, async () => {
+    const archived = await CounterHistoryArchive.findOne({ machineId, date: logicalDate }).lean();
+    if (archived?.records?.length) return archived.records;
 
-  const now = new Date();
-  const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-
-  if (logicalDate === todayStr) {
-    const snapshot = await get(ref(rtdb, `Machines/${machineId}/CounterHistory`));
-    return snapshot.exists() ? Object.values(snapshot.val()) : [];
-  }
-
-  const archived = await CounterHistoryArchive.findOne({ machineId, date: logicalDate }).lean();
-  if (archived?.records?.length) return archived.records;
-
-  const snapshot = await get(ref(rtdb, `Machines/${machineId}/CounterHistory`));
-  return snapshot.exists() ? Object.values(snapshot.val()) : [];
+    const { start, end } = getDateBoundsSeconds(logicalDate);
+    const historyRef = ref(rtdb, `Machines/${machineId}/CounterHistory`);
+    const historyQuery = query(historyRef, orderByChild("timestamp"), startAt(start), endAt(end));
+    const snapshot = await get(historyQuery);
+    if (!snapshot.exists()) return [];
+    return Object.values(snapshot.val() || {});
+  });
 };
 
 // ============================================================================
@@ -302,12 +343,20 @@ const getCounterHistoryForDate = async (machineId, logicalDate) => {
 
 export const getAllData = async (req, res) => {
   try {
-    const snapshot = await get(ref(rtdb, "/"));
-    if (!snapshot.exists()) return res.status(404).json({ success: false, message: "No data found" });
-    res.status(200).json({ success: true, data: snapshot.val() });
+    const machineIds = await getKnownMachineIds();
+    const results = await Promise.all(machineIds.map(async (machineId) => {
+      const data = await getMachineSnapshot(machineId);
+      return data ? { machineId, ...data } : null;
+    }));
+
+    return res.status(200).json({
+      success: true,
+      data: results.filter(Boolean),
+      note: "Large CounterHistory data is intentionally excluded from this endpoint.",
+    });
   } catch (error) {
-    Notifier.toAdmin("Firebase Error", `Failed to get All Data: ${error.message}`, "CRITICAL_ERROR");
-    res.status(500).json({ success: false, message: error.message });
+    Notifier.toAdmin("Firebase Error", `Failed to get machine data: ${error.message}`, "CRITICAL_ERROR");
+    return res.status(500).json({ success: false, message: "Failed to fetch machine data" });
   }
 };
 
@@ -326,11 +375,11 @@ export const getTotalOutput = async (req, res) => {
 export const getMachineData = async (req, res) => {
   const { machineId } = req.params;
   try {
-    const snapshot = await get(ref(rtdb, `Machines/${machineId}`));
-    if (!snapshot.val()) return res.status(404).json({ success: false, message: "Machine not found" });
-    res.status(200).json({ success: true, data: snapshot.val() });
+    const data = await getMachineSnapshot(machineId);
+    if (!data) return res.status(404).json({ success: false, message: "Machine not found" });
+    return res.status(200).json({ success: true, data });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    return res.status(500).json({ success: false, message: "Server Error" });
   }
 };
 
@@ -338,41 +387,14 @@ export const getMachineData = async (req, res) => {
 export const getCounterHistory = async (req, res) => {
   try {
     const { machineId } = req.params;
-    const { date } = req.query;
-
-    // Terminal එකේ බලාගැනීම සඳහා Logs
-    console.log(`\n--- Fetching Data for Machine: ${machineId} ---`);
-    console.log(`Target Date: ${date || "Today (Default)"}`);
-    console.log(`Checking Firebase Path: Machines/${machineId}/CounterHistory`);
-
-    // 1. Firebase එකෙන් කෙලින්ම Data එනවද කියලා Check කරමු
-    const rawRef = ref(rtdb, `Machines/${machineId}/CounterHistory`);
-    const snapshot = await get(rawRef);
-
-    if (!snapshot.exists()) {
-      console.log("❌ Firebase එකේ මෙම path එකට අදාලව දත්ත නැත!");
-    } else {
-      const dataKeys = Object.keys(snapshot.val());
-      console.log(`✅ Firebase එකෙන් දත්ත ලැබුණා! සම්පූර්ණ වාර්තා ගණන: ${dataKeys.length}`);
-    }
-
-    // 2. අදාළ දිනයට දත්ත ලබා ගැනීම
-    let targetDate = date;
-    if (!targetDate) {
+    const targetDate = req.query.date || (() => {
       const now = new Date();
-      targetDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-    }
+      return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    })();
 
     const historyData = await getCounterHistoryForDate(machineId, targetDate);
 
-    if (historyData.length === 0) {
-      console.log("⚠️ Array එකක් ලෙස දත්ත සකස් වීමේදී Empty Array එකක් ලැබී ඇත (Archive/Date ගැටළුවක් විය හැක).");
-    } else {
-      console.log(`✅ Postman වෙත දත්ත වාර්තා ${historyData.length} ක් යවන ලදී.`);
-    }
-
-    // දත්ත Response එකක් ලෙස යැවීම
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       date: targetDate,
       totalRecords: historyData.length,
@@ -380,9 +402,14 @@ export const getCounterHistory = async (req, res) => {
     });
   } catch (error) {
     console.error("❌ Error in getCounterHistory:", error);
-    res.status(500).json({ success: false, message: error.message });
+    return res.status(500).json({ success: false, message: "Failed to fetch counter history" });
   }
 };
+
+// ============================================================================
+// 5-6. LIVE METRICS / HOURLY PRODUCTION / GAP ANALYSIS
+// ============================================================================
+
 export const getMachineLiveMetrics = async (req, res) => {
   try {
     const { machineId } = req.params;
@@ -414,13 +441,12 @@ export const getHourlyTableData = async (req, res) => {
     const { injectionMachine, line } = await getOptimizedConfig(machineId, null, logicalDate);
     const cavity = injectionMachine?.cavities || line?.cavity || 1;
 
-    const rawHistory = await getCounterHistoryForDate(machineId, logicalDate);
-    if (rawHistory.length === 0) {
-      return res.status(200).json({ success: true, hourlyData: [], totalOutput: 0, firstTime: null, runs: [] });
-    }
-
-    const historyData = getShiftHistory(rawHistory, logicalDate, shiftStartTime, shiftEndTime);
-    const metrics = calculateProductionMetrics(historyData, shiftStartTime, shiftEndTime, cavity);
+    const metrics = await cached(`hourly-table:${machineId}:${logicalDate}:${shiftStartTime || ""}:${shiftEndTime || ""}:${cavity}`, 15_000, async () => {
+      const rawHistory = await getCounterHistoryForDate(machineId, logicalDate);
+      if (rawHistory.length === 0) return { totalOutput: 0, hourlyData: [], firstTime: null, runs: [] };
+      const historyData = getShiftHistory(rawHistory, logicalDate, shiftStartTime, shiftEndTime);
+      return calculateProductionMetrics(historyData, shiftStartTime, shiftEndTime, cavity);
+    });
 
     return res.status(200).json({
       success: true,
@@ -444,13 +470,12 @@ export const getHourlyProductionData = async (req, res) => {
     const { injectionMachine, line } = await getOptimizedConfig(machineId, null, logicalDate);
     const cavity = injectionMachine?.cavities || line?.cavity || 1;
 
-    const rawHistory = await getCounterHistoryForDate(machineId, logicalDate);
-    if (rawHistory.length === 0) {
-      return res.status(200).json({ success: true, hourlyData: [], totalOutput: 0, firstTime: null, runs: [] });
-    }
-
-    const historyData = getShiftHistory(rawHistory, logicalDate, shiftStartTime, shiftEndTime);
-    const metrics = calculateProductionMetrics(historyData, shiftStartTime, shiftEndTime, cavity);
+    const metrics = await cached(`hourly-production:${machineId}:${logicalDate}:${shiftStartTime || ""}:${shiftEndTime || ""}:${cavity}`, 15_000, async () => {
+      const rawHistory = await getCounterHistoryForDate(machineId, logicalDate);
+      if (rawHistory.length === 0) return { totalOutput: 0, hourlyData: [], firstTime: null, runs: [] };
+      const historyData = getShiftHistory(rawHistory, logicalDate, shiftStartTime, shiftEndTime);
+      return calculateProductionMetrics(historyData, shiftStartTime, shiftEndTime, cavity);
+    });
 
     return res.status(200).json({
       success: true,
@@ -486,34 +511,28 @@ export const getCombinedProductionGaps = async (req, res) => {
 
     const logicalDate = getLogicalShiftDate(date, startTime, endTime);
 
-    const rawHistory = await getCounterHistoryForDate(targetMachineId, logicalDate);
-    if (rawHistory.length === 0) return res.status(404).json({ success: false, message: "No CounterHistory found" });
-
-    const history = getShiftHistory(rawHistory, logicalDate, startTime, endTime);
-
-    const gapData = [];
-    for (let i = 1; i < history.length; i++) {
-      const current = history[i];
-      const previous = history[i - 1];
-
-      if (current.Count > previous.Count) {
-        let gapSeconds = 0;
-        if (current.timestamp && previous.timestamp) {
-          gapSeconds = current.timestamp - previous.timestamp;
-        } else {
-          const currTime = new Date(current.Time.replace(/\//g, "-")).getTime() / 1000;
-          const prevTime = new Date(previous.Time.replace(/\//g, "-")).getTime() / 1000;
-          gapSeconds = currTime - prevTime;
-        }
-        if (gapSeconds >= 0) {
-          gapData.push({
-            count: current.Count * cavity,
-            time: current.Time.split(" ")[1],
-            gapSeconds: Math.round(gapSeconds),
-          });
+    const gapData = await cached(`production-gaps:${targetMachineId}:${logicalDate}:${startTime}:${endTime}:${cavity}`, 15_000, async () => {
+      const rawHistory = await getCounterHistoryForDate(targetMachineId, logicalDate);
+      if (rawHistory.length === 0) return [];
+      const history = getShiftHistory(rawHistory, logicalDate, startTime, endTime);
+      const gaps = [];
+      for (let i = 1; i < history.length; i++) {
+        const current = history[i];
+        const previous = history[i - 1];
+        if (current.Count > previous.Count) {
+          let gapSeconds = 0;
+          if (current.timestamp && previous.timestamp) gapSeconds = current.timestamp - previous.timestamp;
+          else {
+            const currTime = new Date(current.Time.replace(/\//g, "-")).getTime() / 1000;
+            const prevTime = new Date(previous.Time.replace(/\//g, "-")).getTime() / 1000;
+            gapSeconds = currTime - prevTime;
+          }
+          if (gapSeconds >= 0) gaps.push({ count: current.Count * cavity, time: current.Time.split(" ")[1], gapSeconds: Math.round(gapSeconds) });
         }
       }
-    }
+      return gaps;
+    });
+    if (gapData.length === 0) return res.status(200).json({ success: true, lineId: lineId || null, machineId: targetMachineId, date: logicalDate, startTime, endTime, dailyTarget, averageGap: 0, data: [] });
 
     let plannedAverageGap = 0;
     if (dailyTarget > 0) {
@@ -544,10 +563,19 @@ export const getCombinedProductionGaps = async (req, res) => {
 // 7. OTHER HELPERS (FREE MACHINES, CRON JOBS, ETC)
 // ============================================================================
 
+
+// ============================================================================
+// 7. OTHER HELPERS (FREE MACHINES, CRON JOBS, ETC)
+// ============================================================================
+
 export const getFreeCounterMachines = async (req, res) => {
   try {
-    const machineSnapshot = await get(ref(rtdb, "Machines"));
-    const machines = machineSnapshot.val() || {};
+    const machineIds = await getKnownMachineIds();
+    const machineEntries = await Promise.all(machineIds.map(async (machineId) => {
+      const data = await getMachineSnapshot(machineId);
+      return [machineId, data || {}];
+    }));
+    const machines = Object.fromEntries(machineEntries);
 
     const assignedLines = await Line.find({}, "machineId").select("machineId").lean();
     const assignedInjections = await InjectionMachine.find({}, "machineId").select("machineId").lean();
@@ -596,18 +624,19 @@ export const getLiveDataByLineId = async (req, res) => {
 
 export const getMachineStatus = async (req, res) => {
   try {
-    const snapshot = await get(ref(rtdb, "Machines"));
-    if (!snapshot.exists()) return res.status(200).json({ success: true, data: [] });
+    const machineIds = await getKnownMachineIds();
 
-    const machines = snapshot.val();
-    const statusData = Object.entries(machines).map(([machineId, machineData]) => ({
-      machineId,
-      ...(machineData.Health || {}),
-      liveCount: Number(machineData?.LiveStatus?.Count ?? 0),
-    }));
-
-    return res.status(200).json({ success: true, data: statusData });
+    // Read only Health + LiveStatus for each machine. CounterHistory is never loaded.
+    const data = await cached("machine-status-response", 2_500, async () => {
+      return (await Promise.all(machineIds.map(async (machineId) => {
+        const machine = await getMachineSnapshot(machineId);
+        if (!machine) return null;
+        return { machineId, ...(machine.Health || {}), liveCount: Number(machine.LiveStatus?.Count ?? 0) };
+      }))).filter(Boolean);
+    });
+    return res.status(200).json({ success: true, data });
   } catch (error) {
+    console.error("❌ getMachineStatus:", error);
     return res.status(500).json({ success: false, message: "Server Error" });
   }
 };
@@ -617,10 +646,10 @@ export const deleteOldCounterHistory = async (req, res) => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    const machinesSnapshot = await get(ref(rtdb, "Machines"));
-    if (!machinesSnapshot.exists()) return res.status(404).json({ success: false, message: "No machines found" });
+    const machineIds = await getKnownMachineIds();
+    if (machineIds.length === 0) return res.status(404).json({ success: false, message: "No machines found" });
 
-    const machines = machinesSnapshot.val();
+    const machines = Object.fromEntries(machineIds.map((id) => [id, true]));
     let totalDeleted = 0;
     let totalArchived = 0;
 
@@ -673,12 +702,12 @@ export const deleteOldCounterHistory = async (req, res) => {
 // 🔥 RTDB එකේ ඇති දත්ත නොමකා MongoDB වෙත Archive කිරීමේ (Migration) Function එක
 export const migrateDataToMongo = async (req, res) => {
   try {
-    const machinesSnapshot = await get(ref(rtdb, "Machines"));
-    if (!machinesSnapshot.exists()) {
-      return res.status(404).json({ success: false, message: "No machines found in RTDB" });
+    const machineIds = await getKnownMachineIds();
+    if (machineIds.length === 0) {
+      return res.status(404).json({ success: false, message: "No machines registered" });
     }
 
-    const machines = machinesSnapshot.val();
+    const machines = Object.fromEntries(machineIds.map((id) => [id, true]));
     let totalArchived = 0;
     const migrationDetails = [];
 

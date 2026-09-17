@@ -4,6 +4,9 @@ import { rtdb } from "../database.js";
 import User from "../models/Users.js";
 import Registration from "../models/Registration.js";
 import { Line } from "../models/Line.js";
+import { InjectionMachine } from "../models/InjectionMachine.js";
+import { Counter } from "../models/Machine.js";
+import { cached } from "../utils/memoryCache.js";
 import { LineHistory } from "../models/LineHistory.js";
 import { AuditLog } from "../models/AuditLog.js";
 
@@ -28,6 +31,21 @@ const isAdmin = (req, res) => {
   return false;
 };
 
+
+const getKnownMachineIds = async () => cached("admin-machine-ids", 15_000, async () => {
+  const [lineIds, injectionIds, counterIds] = await Promise.all([
+    Line.distinct("machineId"),
+    InjectionMachine.distinct("machineId"),
+    Counter.distinct("counterId"),
+  ]);
+  return [...new Set([...lineIds, ...injectionIds, ...counterIds].filter(Boolean).map(String))];
+});
+
+const getMachineHealth = async (machineId) => cached(`admin-health:${machineId}`, 2_500, async () => {
+  const snapshot = await get(ref(rtdb, `Machines/${machineId}/Health`));
+  return snapshot.exists() ? snapshot.val() : null;
+});
+
 // ==========================================
 // Admin Specific Controllers with Authorization
 // ==========================================
@@ -36,10 +54,10 @@ export const getDashboardStats = async (req, res) => {
   if (!isAdmin(req, res)) return;
   try {
     const totalUsers = await User.countDocuments();
-    const machinesSnapshot = await get(ref(rtdb, "Machines"));
-    const machineEntries = Object.entries(machinesSnapshot.val() || {});
-    const machinesOnline = machineEntries.filter(([, m]) => (m.status || "").toLowerCase() === "online").length;
-    res.status(200).json({ success: true, data: { totalUsers, machinesOnline, totalMachines: machineEntries.length } });
+    const machineIds = await getKnownMachineIds();
+    const healthEntries = await Promise.all(machineIds.map(async (id) => [id, await getMachineHealth(id)]));
+    const machinesOnline = healthEntries.filter(([, h]) => (h?.status || "").toLowerCase() === "online").length;
+    res.status(200).json({ success: true, data: { totalUsers, machinesOnline, totalMachines: machineIds.length } });
   } catch (error) {
     Notifier.toAdmin("System Error", `Dashboard Stats Error: ${error.message}`, "CRITICAL_ERROR", req.user?.name || "System");
     res.status(500).json({ success: false, message: error.message });
@@ -79,7 +97,7 @@ export const approveRegistration = async (req, res) => {
 export const getAllLines = async (req, res) => {
   if (!isAdmin(req, res)) return;
   try {
-    const lines = await Line.find();
+    const lines = await Line.find().lean();
     res.status(200).json({ success: true, data: lines });
   } catch (error) {
     Notifier.toAdmin("System Error", `Get All Lines Error: ${error.message}`, "CRITICAL_ERROR", req.user?.name || "System");
@@ -90,28 +108,22 @@ export const getAllLines = async (req, res) => {
 export const getAvailableMachines = async (req, res) => {
   if (!isAdmin(req, res)) return;
   try {
-    const machineSnapshot = await get(ref(rtdb, "Machines"));
-    const lineSnapshot = await get(ref(rtdb, "Lines"));
+    const machineIds = await getKnownMachineIds();
+    const assignedLines = await Line.find({}, "machineId").lean();
+    const assignedMachines = new Set(assignedLines.map((line) => line.machineId).filter(Boolean).map(String));
 
-    const machines = machineSnapshot.val() || {};
-    const lines = lineSnapshot.val() || {};
-
-    const assignedMachines = new Set();
-
-    Object.values(lines).forEach((line) => {
-      if (line.machineId) {
-        assignedMachines.add(line.machineId);
-      }
-    });
-
-    const availableMachines = Object.entries(machines)
-      .filter(([machineId]) => !assignedMachines.has(machineId))
-      .map(([machineId, machine]) => ({
+    const availableMachines = (await Promise.all(machineIds.map(async (machineId) => {
+      if (assignedMachines.has(machineId)) return null;
+      const health = await getMachineHealth(machineId);
+      const liveSnapshot = await get(ref(rtdb, `Machines/${machineId}/LiveStatus`));
+      const live = liveSnapshot.exists() ? liveSnapshot.val() : {};
+      return {
         machineId,
-        machineName: machine.machineName || machineId,
-        status: machine.status || "offline",
-        machineState: machine.machineState || "idle",
-      }));
+        machineName: health?.machineName || machineId,
+        status: health?.status || "offline",
+        machineState: live?.machineState || health?.machineState || "idle",
+      };
+    }))).filter(Boolean);
 
     return res.status(200).json({
       success: true,

@@ -1,3 +1,4 @@
+import { cached } from "../utils/memoryCache.js";
 import { get, ref } from "firebase/database";
 import { rtdb } from "../database.js";
 import { Line } from "../models/Line.js";
@@ -65,14 +66,13 @@ const canUpdateLine = (req, res) => {
 // ============================================================================
 export const getAllLines = async (req, res) => {
   try {
-    const lines = await Line.find().sort({ lineId: 1 });
+    const lines = await cached("all-lines", 5_000, async () => Line.find().sort({ lineId: 1 }).lean());
     return res.status(200).json({ success: true, count: lines.length, data: lines });
   } catch (error) {
     Notifier.toAdmin("System Error", `Get All Lines Error: ${error.message}`, "CRITICAL_ERROR");
     return res.status(500).json({ success: false, message: error.message });
   }
 };
-
 // ============================================================================
 // 2. GET SINGLE LINE
 // ============================================================================
