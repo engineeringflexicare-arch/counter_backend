@@ -12,6 +12,29 @@ import { InjectionMachine as InjectionMachineModel } from "../models/InjectionMa
 import { Counter } from "../models/Machine.js";
 import { cacheGet, cacheSet, cached } from "../utils/memoryCache.js";
 
+// ----------------------------------------------------------------------------
+// Firebase RTDB missing-index guard.
+// orderByChild("timestamp") queries against Machines/$machineId/CounterHistory
+// require ".indexOn": "timestamp" to be set in the Realtime Database *rules*
+// (Firebase Console -> Realtime Database -> Rules). This is a server-side
+// config change, not something this backend can set for itself at runtime.
+// Without it, every hourly/production/gap request fails and gets retried by
+// the dashboard, which is what drives up free-tier bandwidth and CPU. We only
+// log this once every 60s (instead of once per request) so a missing index
+// doesn't itself become a source of log/CPU spam while it's being fixed.
+let lastMissingIndexWarnAt = 0;
+const isMissingIndexError = (error) => /Index not defined/i.test(error?.message || "");
+const warnMissingIndexOnce = (machineId) => {
+  const now = Date.now();
+  if (now - lastMissingIndexWarnAt < 60_000) return;
+  lastMissingIndexWarnAt = now;
+  console.error(
+    `🔥 Firebase Realtime Database is missing the required index for Machines/${machineId}/CounterHistory. ` +
+      `Add ".indexOn": "timestamp" under Machines/$machineId/CounterHistory in the Realtime Database Rules ` +
+      `tab of the Firebase Console, then Publish. See database.rules.snippet.json for the exact block to merge in.`,
+  );
+};
+
 // ============================================================================
 // 1. AUTH HELPER
 // ============================================================================
@@ -338,8 +361,13 @@ const getCounterHistoryCountForDate = async (machineId, logicalDate) => {
   const archived = await CounterHistoryArchive.findOne({ machineId, date: logicalDate }).select({ _id: 1 }).lean();
   if (archived) return null; // archive exists; count is not needed for streaming
   const { start, end } = getDateBoundsSeconds(logicalDate);
-  const snapshot = await get(query(ref(rtdb, `Machines/${machineId}/CounterHistory`), orderByChild("timestamp"), startAt(start), endAt(end), limitToFirst(1)));
-  return snapshot.exists() ? 1 : 0;
+  try {
+    const snapshot = await get(query(ref(rtdb, `Machines/${machineId}/CounterHistory`), orderByChild("timestamp"), startAt(start), endAt(end), limitToFirst(1)));
+    return snapshot.exists() ? 1 : 0;
+  } catch (error) {
+    if (isMissingIndexError(error)) warnMissingIndexOnce(machineId);
+    throw error;
+  }
 };
 
 async function* iterateArchivedRecords(machineId, logicalDate) {
@@ -370,7 +398,13 @@ async function* iterateRtdbRecords(machineId, logicalDate) {
       ? query(historyRef, orderByChild("timestamp"), startAt(start), endAt(end), limitToFirst(HISTORY_PAGE_SIZE))
       : query(historyRef, orderByChild("timestamp"), startAt(cursorTimestamp, cursorKey), endAt(end), limitToFirst(HISTORY_PAGE_SIZE));
 
-    const snapshot = await get(pageQuery);
+    let snapshot;
+    try {
+      snapshot = await get(pageQuery);
+    } catch (error) {
+      if (isMissingIndexError(error)) warnMissingIndexOnce(machineId);
+      throw error;
+    }
     if (!snapshot.exists()) return;
 
     const entries = Object.entries(snapshot.val() || {});
