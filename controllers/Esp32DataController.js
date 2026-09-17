@@ -1,4 +1,4 @@
-import { get, ref, remove, update, query, orderByChild, startAt, endAt } from "firebase/database";
+import { get, ref, remove, update, query, orderByChild, startAt, endAt, limitToFirst } from "firebase/database";
 import { rtdb } from "../database.js";
 import jwt from "jsonwebtoken";
 import { Notifier } from "../utils/Notifier.js";
@@ -318,23 +318,257 @@ const getDateBoundsSeconds = (dateStr) => {
 };
 
 // ============================================================================
-// 3.1 NEW: ARCHIVE-AWARE COUNTER HISTORY FETCHER
+// 3.1 MEMORY-SAFE HISTORY ITERATION
 // ============================================================================
-const getCounterHistoryForDate = async (machineId, logicalDate) => {
-  if (!machineId || !logicalDate) return [];
-  // Only deduplicate concurrent reads. Do NOT retain raw history in the cache:
-  // a day's history can itself be large and must be released after processing.
-  return cached(`history-load:${machineId}:${logicalDate}`, 1_500, async () => {
-    const archived = await CounterHistoryArchive.findOne({ machineId, date: logicalDate }).lean();
-    if (archived?.records?.length) return archived.records;
+// IMPORTANT: Never load a complete CounterHistory day into JS memory for
+// dashboard calculations. RTDB is paged in small chunks and legacy Mongo
+// archive documents are streamed through an aggregation cursor.
+const HISTORY_PAGE_SIZE = 750;
 
-    const { start, end } = getDateBoundsSeconds(logicalDate);
-    const historyRef = ref(rtdb, `Machines/${machineId}/CounterHistory`);
-    const historyQuery = query(historyRef, orderByChild("timestamp"), startAt(start), endAt(end));
-    const snapshot = await get(historyQuery);
-    if (!snapshot.exists()) return [];
-    return Object.values(snapshot.val() || {});
+const toTimestampSeconds = (item) => {
+  const ts = Number(item?.timestamp);
+  if (Number.isFinite(ts)) return ts;
+  if (!item?.Time) return NaN;
+  const parsed = new Date(String(item.Time).replace(/\//g, "-")).getTime();
+  return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : NaN;
+};
+
+const getCounterHistoryCountForDate = async (machineId, logicalDate) => {
+  if (!machineId || !logicalDate) return 0;
+  const archived = await CounterHistoryArchive.findOne({ machineId, date: logicalDate }).select({ _id: 1 }).lean();
+  if (archived) return null; // archive exists; count is not needed for streaming
+  const { start, end } = getDateBoundsSeconds(logicalDate);
+  const snapshot = await get(query(ref(rtdb, `Machines/${machineId}/CounterHistory`), orderByChild("timestamp"), startAt(start), endAt(end), limitToFirst(1)));
+  return snapshot.exists() ? 1 : 0;
+};
+
+async function* iterateArchivedRecords(machineId, logicalDate) {
+  const cursor = CounterHistoryArchive.aggregate([
+    { $match: { machineId: String(machineId), date: String(logicalDate) } },
+    { $unwind: "$records" },
+    { $match: { "records.Time": { $exists: true } } },
+    { $sort: { "records.timestamp": 1, "records.Time": 1 } },
+    { $project: { _id: 0, record: "$records" } },
+  ])
+    .allowDiskUse(true)
+    .cursor({ batchSize: HISTORY_PAGE_SIZE });
+
+  for await (const row of cursor) {
+    if (row?.record) yield row.record;
+  }
+}
+
+async function* iterateRtdbRecords(machineId, logicalDate) {
+  const { start, end } = getDateBoundsSeconds(logicalDate);
+  const historyRef = ref(rtdb, `Machines/${machineId}/CounterHistory`);
+  let cursorTimestamp = start;
+  let cursorKey = undefined;
+  let firstPage = true;
+
+  while (true) {
+    const pageQuery = firstPage
+      ? query(historyRef, orderByChild("timestamp"), startAt(start), endAt(end), limitToFirst(HISTORY_PAGE_SIZE))
+      : query(historyRef, orderByChild("timestamp"), startAt(cursorTimestamp, cursorKey), endAt(end), limitToFirst(HISTORY_PAGE_SIZE));
+
+    const snapshot = await get(pageQuery);
+    if (!snapshot.exists()) return;
+
+    const entries = Object.entries(snapshot.val() || {});
+    if (!entries.length) return;
+
+    let emitted = 0;
+    let lastTimestamp = cursorTimestamp;
+    let lastKey = cursorKey;
+
+    for (const [key, record] of entries) {
+      const ts = toTimestampSeconds(record);
+      if (!Number.isFinite(ts)) continue;
+      if (!firstPage && (ts < cursorTimestamp || (ts === cursorTimestamp && key === cursorKey))) continue;
+      if (ts < start || ts > end) continue;
+      yield record;
+      emitted++;
+      lastTimestamp = ts;
+      lastKey = key;
+    }
+
+    if (entries.length < HISTORY_PAGE_SIZE || emitted === 0) return;
+    if (lastKey === cursorKey && lastTimestamp === cursorTimestamp) return;
+
+    cursorTimestamp = lastTimestamp;
+    cursorKey = lastKey;
+    firstPage = false;
+  }
+}
+
+const archiveExists = async (machineId, logicalDate) =>
+  Boolean(await CounterHistoryArchive.exists({ machineId: String(machineId), date: String(logicalDate) }));
+
+async function* iterateCounterHistoryForDate(machineId, logicalDate) {
+  if (!machineId || !logicalDate) return;
+  if (await archiveExists(machineId, logicalDate)) {
+    yield* iterateArchivedRecords(machineId, logicalDate);
+    return;
+  }
+  yield* iterateRtdbRecords(machineId, logicalDate);
+}
+
+const addDays = (dateStr, days) => {
+  const d = new Date(`${dateStr}T00:00:00`);
+  d.setDate(d.getDate() + days);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
+const getShiftBounds = (logicalDateStr, startTimeStr, endTimeStr) => {
+  const [sh, sm] = (startTimeStr || "00:00").split(":").map(Number);
+  const [eh, em] = (endTimeStr || "23:59").split(":").map(Number);
+  const start = new Date(`${logicalDateStr}T${String(sh).padStart(2, "0")}:${String(sm).padStart(2, "0")}:00`);
+  const end = new Date(`${logicalDateStr}T${String(eh).padStart(2, "0")}:${String(em).padStart(2, "0")}:00`);
+  if (end <= start) end.setDate(end.getDate() + 1);
+  return { start, end, overnight: end.getDate() !== start.getDate() || end.getTime() > start.getTime() + 24 * 3600 * 1000 - 1 };
+};
+
+async function* iterateCounterHistoryForShift(machineId, logicalDate, startTimeStr, endTimeStr) {
+  const { start, end } = getShiftBounds(logicalDate, startTimeStr, endTimeStr);
+  const dates = [logicalDate];
+  const endDate = `${end.getFullYear()}-${String(end.getMonth() + 1).padStart(2, "0")}-${String(end.getDate()).padStart(2, "0")}`;
+  if (endDate !== logicalDate) dates.push(endDate);
+
+  for (const datePart of dates) {
+    for await (const record of iterateCounterHistoryForDate(machineId, datePart)) {
+      const tsMs = toTimestampSeconds(record) * 1000;
+      if (!Number.isFinite(tsMs)) continue;
+      if (tsMs >= start.getTime() && tsMs <= end.getTime()) yield record;
+    }
+  }
+}
+
+const createEmptyMetricState = (shiftStartTime, shiftEndTime) => {
+  const { buckets, shiftStartMinutes } = generateShiftHourBuckets(shiftStartTime, shiftEndTime);
+  return { buckets, shiftStartMinutes, totalOutput: 0, firstTime: null, runs: [], current: null, runNo: 0 };
+};
+
+const cloneBuckets = (buckets) => buckets.map((b) => ({ ...b, output: 0 }));
+
+const finalizeStreamRun = (state) => {
+  if (!state.current || state.current.length < MIN_READINGS_PER_RUN) return;
+  const first = state.current[0];
+  const last = state.current[state.current.length - 1];
+  const extractHM = (item) => (item?.Time && String(item.Time).includes(" ") ? String(item.Time).split(" ")[1].slice(0, 5) : null);
+  state.runs.push({
+    runNo: ++state.runNo,
+    startTime: extractHM(first) || "—",
+    endTime: extractHM(last) || "—",
+    totalOutput: state.currentTotal,
+    hourlyData: state.currentBuckets.map((b) => ({ hour: b.label, output: b.output })),
   });
+};
+
+const consumeProductionRecord = (state, record, cavity) => {
+  const count = Number(record?.Count);
+  if (!Number.isFinite(count)) return;
+  if (!state.firstTime) state.firstTime = record?.Time || null;
+
+  if (!state.current) {
+    state.current = [record];
+    state.currentTotal = 0;
+    state.currentBuckets = cloneBuckets(state.buckets);
+    state.lastValid = record;
+    return;
+  }
+
+  const previous = state.lastValid;
+  const prevCount = Number(previous?.Count);
+  if (!Number.isFinite(prevCount)) return;
+  if (count === prevCount) return;
+
+  const lastTs = toTimestampSeconds(previous);
+  const candidateTs = toTimestampSeconds(record);
+  if (Number.isFinite(lastTs) && Number.isFinite(candidateTs) && candidateTs < lastTs - OUT_OF_ORDER_TOLERANCE_SECONDS) return;
+
+  if (count < prevCount) {
+    const drop = prevCount - count;
+    const ratio = prevCount > 0 ? drop / prevCount : 0;
+    if (drop <= SMALL_FLUCTUATION_ABS || ratio < SMALL_FLUCTUATION_RATIO) return;
+  }
+
+  const explicitReset = isExplicitResetEvent(record);
+  const bootIdChanged = hasRunIdentifierChanged(previous, record);
+  let isRealReset = explicitReset || bootIdChanged;
+  if (!isRealReset && count <= RESTART_COUNT_THRESHOLD && prevCount > SIGNIFICANT_COUNT_FLOOR) isRealReset = true;
+  if (!isRealReset && count < prevCount) {
+    const ratio = prevCount > 0 ? (prevCount - count) / prevCount : 0;
+    if (ratio >= RESET_DROP_RATIO) isRealReset = true;
+  }
+
+  if (isRealReset) {
+    finalizeStreamRun(state);
+    state.current = [record];
+    state.currentTotal = 0;
+    state.currentBuckets = cloneBuckets(state.buckets);
+    state.lastValid = record;
+    return;
+  }
+
+  const delta = (count - prevCount) * cavity;
+  state.current.push(record);
+  state.lastValid = record;
+  if (delta <= 0) return;
+
+  state.totalOutput += delta;
+  state.currentTotal += delta;
+
+  if (!record?.Time || !String(record.Time).includes(" ")) return;
+  const [recH, recM] = String(record.Time).split(" ")[1].split(":").map(Number);
+  if (!Number.isFinite(recH) || !Number.isFinite(recM)) return;
+  let recordMinutes = recH * 60 + recM;
+  if (recordMinutes < state.shiftStartMinutes) recordMinutes += 1440;
+
+  const targetBucket = state.buckets.find((b) => recordMinutes >= b.startMinutes && recordMinutes < b.endMinutes);
+  if (targetBucket) targetBucket.output += delta;
+  const runBucket = state.currentBuckets.find((b) => recordMinutes >= b.startMinutes && recordMinutes < b.endMinutes);
+  if (runBucket) runBucket.output += delta;
+};
+
+const calculateProductionMetricsStream = async (machineId, logicalDate, shiftStartTime, shiftEndTime, cavity) => {
+  const state = createEmptyMetricState(shiftStartTime, shiftEndTime);
+  for await (const record of iterateCounterHistoryForShift(machineId, logicalDate, shiftStartTime, shiftEndTime)) {
+    consumeProductionRecord(state, record, cavity);
+  }
+  finalizeStreamRun(state);
+  return {
+    totalOutput: state.totalOutput,
+    hourlyData: state.buckets.map((b) => ({ hour: b.label, output: b.output })),
+    firstTime: state.firstTime,
+    runs: state.runs,
+  };
+};
+
+const calculateProductionGapsStream = async (machineId, logicalDate, startTime, endTime, cavity) => {
+  const gaps = [];
+  let previous = null;
+  for await (const current of iterateCounterHistoryForShift(machineId, logicalDate, startTime, endTime)) {
+    if (!previous) { previous = current; continue; }
+    const prevCount = Number(previous.Count);
+    const currCount = Number(current.Count);
+    if (Number.isFinite(prevCount) && Number.isFinite(currCount) && currCount > prevCount) {
+      const prevTs = toTimestampSeconds(previous);
+      const currTs = toTimestampSeconds(current);
+      const gapSeconds = Number.isFinite(prevTs) && Number.isFinite(currTs)
+        ? currTs - prevTs
+        : (new Date(String(current.Time).replace(/\//g, "-")).getTime() - new Date(String(previous.Time).replace(/\//g, "-")).getTime()) / 1000;
+      if (gapSeconds >= 0) gaps.push({ count: (currCount - prevCount) * cavity, time: String(current.Time || "").split(" ")[1] || "—", gapSeconds: Math.round(gapSeconds) });
+    }
+    previous = current;
+  }
+  return gaps;
+};
+
+// Legacy raw-history endpoint only. Dashboard calculations must use the
+// streaming functions above so a complete day is never retained in memory.
+const getCounterHistoryForDate = async (machineId, logicalDate) => {
+  const records = [];
+  for await (const record of iterateCounterHistoryForDate(machineId, logicalDate)) records.push(record);
+  return records;
 };
 
 // ============================================================================
@@ -439,25 +673,14 @@ export const getHourlyTableData = async (req, res) => {
 
   try {
     const { injectionMachine, line } = await getOptimizedConfig(machineId, null, logicalDate);
-    const cavity = injectionMachine?.cavities || line?.cavity || 1;
+    const cavity = Number(injectionMachine?.cavities || line?.cavity || 1) || 1;
+    const cacheKey = `hourly-table:${machineId}:${logicalDate}:${shiftStartTime || ""}:${shiftEndTime || ""}:${cavity}`;
+    const metrics = await cached(cacheKey, 15_000, () => calculateProductionMetricsStream(machineId, logicalDate, shiftStartTime, shiftEndTime, cavity));
 
-    const metrics = await cached(`hourly-table:${machineId}:${logicalDate}:${shiftStartTime || ""}:${shiftEndTime || ""}:${cavity}`, 15_000, async () => {
-      const rawHistory = await getCounterHistoryForDate(machineId, logicalDate);
-      if (rawHistory.length === 0) return { totalOutput: 0, hourlyData: [], firstTime: null, runs: [] };
-      const historyData = getShiftHistory(rawHistory, logicalDate, shiftStartTime, shiftEndTime);
-      return calculateProductionMetrics(historyData, shiftStartTime, shiftEndTime, cavity);
-    });
-
-    return res.status(200).json({
-      success: true,
-      totalOutput: metrics.totalOutput,
-      firstTime: metrics.firstTime,
-      hourlyData: metrics.hourlyData,
-      runs: metrics.runs,
-      cavityConfigured: cavity,
-    });
+    return res.status(200).json({ success: true, totalOutput: metrics.totalOutput, firstTime: metrics.firstTime, hourlyData: metrics.hourlyData, runs: metrics.runs, cavityConfigured: cavity });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    console.error("❌ getHourlyTableData", { machineId, logicalDate, shiftStartTime, shiftEndTime, error: error?.stack || error });
+    return res.status(500).json({ success: false, message: "Failed to calculate hourly production" });
   }
 };
 
@@ -466,26 +689,18 @@ export const getHourlyProductionData = async (req, res) => {
   const { date, shiftStartTime, shiftEndTime } = req.query;
   const logicalDate = getLogicalShiftDate(date, shiftStartTime, shiftEndTime);
 
+  if (!machineId) return res.status(400).json({ success: false, message: "machineId is required" });
+
   try {
     const { injectionMachine, line } = await getOptimizedConfig(machineId, null, logicalDate);
-    const cavity = injectionMachine?.cavities || line?.cavity || 1;
+    const cavity = Number(injectionMachine?.cavities || line?.cavity || 1) || 1;
+    const cacheKey = `hourly-production:${machineId}:${logicalDate}:${shiftStartTime || ""}:${shiftEndTime || ""}:${cavity}`;
+    const metrics = await cached(cacheKey, 15_000, () => calculateProductionMetricsStream(machineId, logicalDate, shiftStartTime, shiftEndTime, cavity));
 
-    const metrics = await cached(`hourly-production:${machineId}:${logicalDate}:${shiftStartTime || ""}:${shiftEndTime || ""}:${cavity}`, 15_000, async () => {
-      const rawHistory = await getCounterHistoryForDate(machineId, logicalDate);
-      if (rawHistory.length === 0) return { totalOutput: 0, hourlyData: [], firstTime: null, runs: [] };
-      const historyData = getShiftHistory(rawHistory, logicalDate, shiftStartTime, shiftEndTime);
-      return calculateProductionMetrics(historyData, shiftStartTime, shiftEndTime, cavity);
-    });
-
-    return res.status(200).json({
-      success: true,
-      totalOutput: metrics.totalOutput,
-      firstTime: metrics.firstTime,
-      hourlyData: metrics.hourlyData,
-      runs: metrics.runs,
-    });
+    return res.status(200).json({ success: true, machineId, date: logicalDate, totalOutput: metrics.totalOutput, firstTime: metrics.firstTime, hourlyData: metrics.hourlyData, runs: metrics.runs });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    console.error("❌ getHourlyProductionData", { machineId, logicalDate, shiftStartTime, shiftEndTime, error: error?.stack || error });
+    return res.status(500).json({ success: false, message: "Failed to calculate hourly production" });
   }
 };
 
@@ -511,27 +726,9 @@ export const getCombinedProductionGaps = async (req, res) => {
 
     const logicalDate = getLogicalShiftDate(date, startTime, endTime);
 
-    const gapData = await cached(`production-gaps:${targetMachineId}:${logicalDate}:${startTime}:${endTime}:${cavity}`, 15_000, async () => {
-      const rawHistory = await getCounterHistoryForDate(targetMachineId, logicalDate);
-      if (rawHistory.length === 0) return [];
-      const history = getShiftHistory(rawHistory, logicalDate, startTime, endTime);
-      const gaps = [];
-      for (let i = 1; i < history.length; i++) {
-        const current = history[i];
-        const previous = history[i - 1];
-        if (current.Count > previous.Count) {
-          let gapSeconds = 0;
-          if (current.timestamp && previous.timestamp) gapSeconds = current.timestamp - previous.timestamp;
-          else {
-            const currTime = new Date(current.Time.replace(/\//g, "-")).getTime() / 1000;
-            const prevTime = new Date(previous.Time.replace(/\//g, "-")).getTime() / 1000;
-            gapSeconds = currTime - prevTime;
-          }
-          if (gapSeconds >= 0) gaps.push({ count: current.Count * cavity, time: current.Time.split(" ")[1], gapSeconds: Math.round(gapSeconds) });
-        }
-      }
-      return gaps;
-    });
+    const gapData = await cached(`production-gaps:${targetMachineId}:${logicalDate}:${startTime}:${endTime}:${cavity}`, 15_000, () =>
+      calculateProductionGapsStream(targetMachineId, logicalDate, startTime, endTime, cavity)
+    );
     if (gapData.length === 0) return res.status(200).json({ success: true, lineId: lineId || null, machineId: targetMachineId, date: logicalDate, startTime, endTime, dailyTarget, averageGap: 0, data: [] });
 
     let plannedAverageGap = 0;
