@@ -60,7 +60,8 @@ const allowedOrigins = ["http://localhost:3001", "http://localhost:5173", "http:
 app.use(
   cors({
     origin: (origin, callback) => {
-      console.log("🌐 Origin:", origin);
+      // Avoid high-volume production logging for every request.
+      if (process.env.LOG_CORS === "true") console.log("🌐 Origin:", origin);
 
       // Postman / Mobile Apps / Server Requests
       if (!origin) {
@@ -84,16 +85,22 @@ app.use(
 // ==========================================
 // Body Parsers
 // ==========================================
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "512kb" }));
+app.use(express.urlencoded({ extended: true, limit: "512kb" }));
 
 // ==========================================
 // Logger
 // ==========================================
 app.use((req, res, next) => {
-  console.log(`📥 ${req.method} ${req.originalUrl}`);
+  if (process.env.LOG_REQUESTS === "true") console.log(`📥 ${req.method} ${req.originalUrl}`);
   next();
 });
+
+// Lightweight memory telemetry. Does not retain request/response payloads.
+setInterval(() => {
+  const m = process.memoryUsage();
+  console.log(`🧠 Memory RSS=${Math.round(m.rss / 1024 / 1024)}MB heap=${Math.round(m.heapUsed / 1024 / 1024)}/${Math.round(m.heapTotal / 1024 / 1024)}MB external=${Math.round(m.external / 1024 / 1024)}MB`);
+}, 60000).unref();
 
 // ==========================================
 // Health Check
@@ -188,8 +195,12 @@ async function startServer() {
     }
 
     await mongoose.connect(mongoUri, {
-      serverSelectionTimeoutMS: 30000,
-      socketTimeoutMS: 45000,
+      serverSelectionTimeoutMS: 10000,
+      socketTimeoutMS: 30000,
+      maxPoolSize: 5,
+      minPoolSize: 0,
+      maxConnecting: 2,
+      compressors: ["zlib"],
     });
 
     console.log("=================================");

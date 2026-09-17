@@ -1,3 +1,4 @@
+import { cached } from "../utils/memoryCache.js";
 import { get, ref } from "firebase/database";
 import { rtdb } from "../database.js";
 import { InjectionMachine } from "../models/InjectionMachine.js";
@@ -55,21 +56,20 @@ const canUpdateMachine = (req, res) => {
 // ============================================================================
 export const getAllInjectionMachines = async (req, res) => {
   try {
-    const machines = await InjectionMachine.find().sort({ injectionMachineNumber: 1 });
+    const machines = await cached("all-injection-machines", 5_000, async () => InjectionMachine.find().sort({ injectionMachineNumber: 1 }).lean());
     return res.status(200).json({ success: true, count: machines.length, data: machines });
   } catch (error) {
     Notifier.toAdmin("System Error", `Get All Injection Machines Error: ${error.message}`, "CRITICAL_ERROR");
     return res.status(500).json({ success: false, message: error.message });
   }
 };
-
 // ============================================================================
 // 2. GET SINGLE INJECTION MACHINE
 // ============================================================================
 export const getInjectionMachineById = async (req, res) => {
   try {
     const { machineNumber } = req.params;
-    const machine = await InjectionMachine.findOne({ injectionMachineNumber: machineNumber });
+    const machine = await InjectionMachine.findOne({ injectionMachineNumber: machineNumber }).lean();
 
     if (!machine) return res.status(404).json({ success: false, message: "Machine not found" });
     return res.status(200).json({ success: true, data: machine });

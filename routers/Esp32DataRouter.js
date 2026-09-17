@@ -26,7 +26,7 @@ const router = express.Router();
 // ====================================================
 router.get("/", getAllData);
 router.get("/status", getMachineStatus);
-router.get("/machine-status", getMachineStatus); // Note: You have two endpoints for the same controller
+router.get("/machine-status", getMachineStatus); // compatibility alias
 router.get("/machines/free", getFreeCounterMachines);
 router.get("/free-counters", getFreeCounterMachines); // Note: You have two endpoints for the same controller
 
