@@ -6,7 +6,7 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 
 // ==========================================
-// පරණ Routers Import කිරීම
+// EXISTING ROUTERS
 // ==========================================
 import AdminRouter from "./routers/AdminRouter.js";
 import Esp32DataRouter from "./routers/Esp32DataRouter.js";
@@ -16,7 +16,7 @@ import ForgotPasswordRouter from "./routers/ForgotPasswordRouter.js";
 import SuperuserRouter from "./routers/SuperuserRoutes.js";
 
 // ==========================================
-// අලුතින් සකස් කළ MES Routers Import කිරීම
+// MES ROUTERS
 // ==========================================
 import orderRoutes from "./routers/orderRoutes.js";
 import planRouter from "./routers/planRoutes.js";
@@ -27,30 +27,66 @@ import salesOrderRoutes from "./routers/salesOrderRoutes.js";
 import machineCalendarRoutes from "./routers/machineCalendarRoutes.js";
 import toolCalendarRoutes from "./routers/toolCalendarRoutes.js";
 import productionPlanningRoutes from "./routers/productionPlanningRoutes.js";
-
-import { startHeartbeatService } from "./services/heartbeatService.js";
 import MouldsRouter from "./routers/MouldRoutes.js";
 
+// ==========================================
+// SERVICES
+// ==========================================
+import { startHeartbeatService } from "./services/heartbeatService.js";
+
+// ==========================================
+// ENVIRONMENT
+// ==========================================
 dotenv.config();
 
+// ==========================================
+// EXPRESS APP
+// ==========================================
 const app = express();
 
 // ==========================================
-// Security Hardening
+// RENDER / REVERSE PROXY CONFIGURATION
+// ==========================================
+// Render sits behind a reverse proxy and sends
+// X-Forwarded-For.
+//
+// "1" = trust the first proxy in front of Express.
+// Required for express-rate-limit to correctly
+// identify client IP addresses.
+//
+// IMPORTANT:
+// This must be configured BEFORE rate-limit middleware.
+// ==========================================
+app.set("trust proxy", 1);
+
+// ==========================================
+// SECURITY HARDENING
 // ==========================================
 app.use(helmet());
 
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // විනාඩි 15යි
-  max: 100, // එක් IP එකකින් විනාඩි 15කට request 100ක් පමණි
-  message: "Too many requests from this IP, please try again after 15 minutes",
-});
-
 // ==========================================
-// Config
+// CONFIGURATION
 // ==========================================
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI;
+
+// ==========================================
+// RATE LIMITER
+// ==========================================
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+
+  // Maximum 100 requests per IP in 15 minutes
+  max: 100,
+
+  message: {
+    success: false,
+    message: "Too many requests from this IP, please try again after 15 minutes",
+  },
+
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 // ==========================================
 // CORS
@@ -60,50 +96,89 @@ const allowedOrigins = ["http://localhost:3001", "http://localhost:5173", "http:
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Avoid high-volume production logging for every request.
-      if (process.env.LOG_CORS === "true") console.log("🌐 Origin:", origin);
+      // Optional CORS logging
+      if (process.env.LOG_CORS === "true") {
+        console.log("🌐 Origin:", origin);
+      }
 
-      // Postman / Mobile Apps / Server Requests
+      // Allow requests without Origin
+      // Example: Postman, mobile apps, server-to-server
       if (!origin) {
         return callback(null, true);
       }
 
+      // Allow known origins
       if (allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
 
       console.error("❌ Blocked by CORS:", origin);
+
       return callback(new Error("Not allowed by CORS"));
     },
+
     credentials: true,
+
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+
     allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
-    maxAge: 86400, // ✅ මෙතනට maxAge එක එකතු කරන ලදී
+
+    maxAge: 86400,
   }),
 );
 
 // ==========================================
-// Body Parsers
+// BODY PARSERS
 // ==========================================
-app.use(express.json({ limit: "512kb" }));
-app.use(express.urlencoded({ extended: true, limit: "512kb" }));
+app.use(
+  express.json({
+    limit: "512kb",
+  }),
+);
+
+app.use(
+  express.urlencoded({
+    extended: true,
+    limit: "512kb",
+  }),
+);
 
 // ==========================================
-// Logger
+// REQUEST LOGGER
 // ==========================================
 app.use((req, res, next) => {
-  if (process.env.LOG_REQUESTS === "true") console.log(`📥 ${req.method} ${req.originalUrl}`);
+  if (process.env.LOG_REQUESTS === "true") {
+    console.log(`📥 ${req.method} ${req.originalUrl}`);
+  }
+
   next();
 });
 
-// Lightweight memory telemetry. Does not retain request/response payloads.
-setInterval(() => {
-  const m = process.memoryUsage();
-  console.log(`🧠 Memory RSS=${Math.round(m.rss / 1024 / 1024)}MB heap=${Math.round(m.heapUsed / 1024 / 1024)}/${Math.round(m.heapTotal / 1024 / 1024)}MB external=${Math.round(m.external / 1024 / 1024)}MB`);
-}, 60000).unref();
+// ==========================================
+// LIGHTWEIGHT MEMORY MONITOR
+// ==========================================
+// Does not retain request/response data.
+// Runs once every 60 seconds.
+// ==========================================
+const memoryMonitor = setInterval(() => {
+  const memory = process.memoryUsage();
+
+  const rss = Math.round(memory.rss / 1024 / 1024);
+
+  const heapUsed = Math.round(memory.heapUsed / 1024 / 1024);
+
+  const heapTotal = Math.round(memory.heapTotal / 1024 / 1024);
+
+  const external = Math.round(memory.external / 1024 / 1024);
+
+  console.log(`🧠 Memory RSS=${rss}MB ` + `heap=${heapUsed}/${heapTotal}MB ` + `external=${external}MB`);
+}, 60000);
+
+// Prevent timer from keeping Node alive
+memoryMonitor.unref();
 
 // ==========================================
-// Health Check
+// HEALTH CHECK
 // ==========================================
 app.get("/", (req, res) => {
   res.status(200).json({
@@ -115,41 +190,63 @@ app.get("/", (req, res) => {
 });
 
 // ==========================================
-// Rate Limiting (Routers වලට කලින් යෙදිය යුතුය)
+// AUTH RATE LIMITING
 // ==========================================
+// These must be registered before the routers.
+// ==========================================
+
 app.use("/api/users/login", authLimiter);
+
 app.use("/api/users/register", authLimiter);
-app.use("/api/auth", authLimiter); // Forgot Password routes සඳහා
+
+app.use("/api/auth", authLimiter);
 
 // ==========================================
-// Routes Configuration (End Points)
+// EXISTING API ROUTES
 // ==========================================
 
-// පරණ Endpoints
 app.use("/api/admin", AdminRouter);
+
 app.use("/api/esp32", Esp32DataRouter);
+
 app.use("/api/lines", LineRouter);
+
 app.use("/api/users", UserRouter);
+
 app.use("/api/auth", ForgotPasswordRouter);
+
 app.use("/api/superuser", SuperuserRouter);
 
-// අලුතින් එක් කළ MES Endpoint
+// ==========================================
+// MES API ROUTES
+// ==========================================
+
 app.use("/api/injection-machines", injectionRoutes);
+
 app.use("/api/v1/orders", orderRoutes);
+
 app.use("/api/v1/production-plans", planRouter);
+
 app.use("/api/v1/inventory", inventoryRoutes);
+
 app.use("/api/v1/capacity-planning", capacityRoutes);
 
 app.use("/api/v1/moulds", MouldsRouter);
+
 app.use("/api/v1/sales-orders", salesOrderRoutes);
+
 app.use("/api/v1/machine-calendar", machineCalendarRoutes);
+
 app.use("/api/v1/tool-calendar", toolCalendarRoutes);
+
 app.use("/api/v1/production-planning", productionPlanningRoutes);
+
 // ==========================================
-// 404 Route Not Found
+// 404 HANDLER
 // ==========================================
 app.use((req, res) => {
   console.log("❌ Route Not Found:", req.originalUrl);
+
   res.status(404).json({
     success: false,
     message: "Route not found",
@@ -158,82 +255,191 @@ app.use((req, res) => {
 });
 
 // ==========================================
-// Global Error Handler
+// GLOBAL ERROR HANDLER
 // ==========================================
 app.use((err, req, res, next) => {
-  console.error("🔥 ERROR:", err.message);
+  console.error("🔥 ERROR:", err?.message || err);
 
-  res.status(err.status || 500).json({
+  const statusCode = err?.status || 500;
+
+  res.status(statusCode).json({
     success: false,
-    message: process.env.NODE_ENV === "production" ? "Internal Server Error" : err.message,
+
+    message: process.env.NODE_ENV === "production" ? "Internal Server Error" : err?.message || "Internal Server Error",
   });
 });
 
 // ==========================================
-// MongoDB Connection & Server Start
+// MONGODB CONNECTION
+// ==========================================
+async function connectMongoDB() {
+  const mongoUri = process.env.MONGO_URI?.trim();
+
+  // ----------------------------------------
+  // Environment Check
+  // ----------------------------------------
+  console.log("=================================");
+
+  console.log("🔍 MongoDB Environment Check");
+
+  console.log("MONGO_URI exists:", Boolean(mongoUri));
+
+  console.log("=================================");
+
+  // ----------------------------------------
+  // Missing URI
+  // ----------------------------------------
+  if (!mongoUri) {
+    throw new Error("MONGO_URI environment variable is missing");
+  }
+
+  // ----------------------------------------
+  // URI Validation
+  // ----------------------------------------
+  if (!mongoUri.startsWith("mongodb://") && !mongoUri.startsWith("mongodb+srv://")) {
+    throw new Error("Invalid MongoDB URI format. URI must start with mongodb:// or mongodb+srv://");
+  }
+
+  // ----------------------------------------
+  // Connect
+  // ----------------------------------------
+  await mongoose.connect(mongoUri, {
+    serverSelectionTimeoutMS: 10000,
+
+    socketTimeoutMS: 30000,
+
+    maxPoolSize: 5,
+
+    minPoolSize: 0,
+
+    maxConnecting: 2,
+
+    compressors: ["zlib"],
+  });
+
+  // ----------------------------------------
+  // Success
+  // ----------------------------------------
+  console.log("=================================");
+
+  console.log("🍃 MongoDB Connected Successfully");
+
+  console.log("🏠 Host:", mongoose.connection.host);
+
+  console.log("📚 Database:", mongoose.connection.name);
+
+  console.log("=================================");
+}
+
+// ==========================================
+// MONGODB EVENTS
+// ==========================================
+
+mongoose.connection.on("error", (error) => {
+  console.error("🍃 MongoDB Error:", error.message);
+});
+
+mongoose.connection.on("disconnected", () => {
+  console.warn("⚠️ MongoDB Disconnected");
+});
+
+mongoose.connection.on("reconnected", () => {
+  console.log("🔄 MongoDB Reconnected");
+});
+
+// ==========================================
+// START SERVER
 // ==========================================
 async function startServer() {
   try {
-    const mongoUri = process.env.MONGO_URI?.trim();
+    // --------------------------------------
+    // MongoDB
+    // --------------------------------------
+    await connectMongoDB();
 
-    console.log("=================================");
-    console.log("🔍 MongoDB Environment Check");
-    console.log("MONGO_URI exists:", !!mongoUri);
-
-    if (mongoUri) {
-      console.log("URI prefix:", mongoUri.substring(0, 20));
-      console.log("URI length:", mongoUri.length);
-    }
-    console.log("=================================");
-
-    if (!mongoUri) {
-      throw new Error("MONGO_URI environment variable is missing");
-    }
-
-    if (!mongoUri.startsWith("mongodb://") && !mongoUri.startsWith("mongodb+srv://")) {
-      throw new Error(`Invalid MongoDB URI format. URI must start with mongodb:// or mongodb+srv://`);
-    }
-
-    await mongoose.connect(mongoUri, {
-      serverSelectionTimeoutMS: 10000,
-      socketTimeoutMS: 30000,
-      maxPoolSize: 5,
-      minPoolSize: 0,
-      maxConnecting: 2,
-      compressors: ["zlib"],
-    });
-
-    console.log("=================================");
-    console.log("🍃 MongoDB Connected Successfully");
-    console.log("🏠 Host:", mongoose.connection.host);
-    console.log("📚 Database:", mongoose.connection.name);
-    console.log("=================================");
-
+    // --------------------------------------
+    // HTTP Server
+    // --------------------------------------
     app.listen(PORT, () => {
       console.log("=================================");
+
       console.log(`🚀 Server running on port ${PORT}`);
 
-      startHeartbeatService();
-
       console.log(`🌍 Environment: ${process.env.NODE_ENV || "development"}`);
+
       console.log(`🔗 Port: ${PORT}`);
+
       console.log("=================================");
+
+      // ------------------------------------
+      // Heartbeat Service
+      // ------------------------------------
+      try {
+        startHeartbeatService();
+
+        console.log("⏱️ Heartbeat monitoring service started (memory-safe mode).");
+      } catch (heartbeatError) {
+        console.error("❌ Failed to start heartbeat service:", heartbeatError?.message || heartbeatError);
+      }
     });
   } catch (error) {
     console.error("=================================");
-    console.error("❌ MongoDB Connection Failed");
-    console.error("Message:", error.message);
 
-    if (process.env.MONGO_URI) {
-      const uri = process.env.MONGO_URI.trim();
-      console.error("URI Prefix:", uri.substring(0, Math.min(30, uri.length)));
-    }
+    console.error("❌ Server Startup Failed");
 
-    console.error(error);
+    console.error("Message:", error?.message || error);
+
     console.error("=================================");
 
     process.exit(1);
   }
 }
 
+// ==========================================
+// GRACEFUL SHUTDOWN
+// ==========================================
+async function gracefulShutdown(signal) {
+  console.log(`\n🛑 ${signal} received`);
+
+  try {
+    // Stop accepting new MongoDB operations
+    if (mongoose.connection.readyState !== 0) {
+      await mongoose.connection.close();
+
+      console.log("🍃 MongoDB connection closed");
+    }
+
+    console.log("✅ Graceful shutdown completed");
+
+    process.exit(0);
+  } catch (error) {
+    console.error("❌ Error during shutdown:", error?.message || error);
+
+    process.exit(1);
+  }
+}
+
+// ==========================================
+// PROCESS SIGNALS
+// ==========================================
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+// ==========================================
+// UNHANDLED ERRORS
+// ==========================================
+process.on("unhandledRejection", (reason) => {
+  console.error("🔥 Unhandled Promise Rejection:", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("🔥 Uncaught Exception:", error);
+
+  process.exit(1);
+});
+
+// ==========================================
+// START APPLICATION
+// ==========================================
 startServer();
