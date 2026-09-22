@@ -8,6 +8,7 @@ import {
   getMachineLiveMetrics,
   getLiveDataByLineId,
   getHourlyTableData,
+  getAvailableMachines,
   getFreeCounterMachines,
   getTotalOutput,
   getMachineStatus,
@@ -28,7 +29,9 @@ router.get("/", getAllData);
 router.get("/status", getMachineStatus);
 router.get("/machine-status", getMachineStatus); // compatibility alias
 router.get("/machines/free", getFreeCounterMachines);
-router.get("/free-counters", getFreeCounterMachines); // Note: You have two endpoints for the same controller
+router.get("/machines/available", getAvailableMachines); // explicit route
+router.get("/available-machines", getAvailableMachines); // explicit route
+router.get("/free-counters", getFreeCounterMachines); // legacy alias
 
 // ====================================================
 // Machine Data & Metrics Routes

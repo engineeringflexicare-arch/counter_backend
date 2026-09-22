@@ -6,6 +6,8 @@ import { LineHistory } from "../models/LineHistory.js";
 import { AuditLog } from "../models/AuditLog.js";
 import { Notification } from "../models/Notification.js";
 import Configuration from "../models/Configuration.js";
+import { InjectionMachine } from "../models/InjectionMachine.js";
+import { Counter } from "../models/Machine.js";
 import { Notifier } from "../utils/Notifier.js";
 import jwt from "jsonwebtoken";
 
@@ -88,18 +90,58 @@ export const getLineById = async (req, res) => {
   }
 };
 
+const getKnownMachineIds = async () =>
+  cached("line-machine-ids", 15_000, async () => {
+    const [lineIds, injectionIds, counterIds] = await Promise.all([Line.distinct("machineId"), InjectionMachine.distinct("machineId"), Counter.distinct("counterId")]);
+
+    return [...new Set([...lineIds, ...injectionIds, ...counterIds].filter(Boolean).map(String))];
+  });
+
+const getMachineHealth = async (machineId) =>
+  cached(`line-health:${machineId}`, 2_500, async () => {
+    const snapshot = await get(ref(rtdb, `Machines/${machineId}/Health`));
+    return snapshot.exists() ? snapshot.val() : null;
+  });
+
 // ============================================================================
 // 3. GET AVAILABLE MACHINES
 // ============================================================================
 export const getAvailableMachines = async (req, res) => {
   try {
-    const configs = await Configuration.find();
-    const assignedLines = await Line.find();
-    const assignedMachines = assignedLines.map((line) => line.machineId).filter(Boolean);
+    const machineIds = await getKnownMachineIds();
 
-    const machines = configs.filter((config) => !assignedMachines.includes(config.device_id)).map((config) => ({ machineId: config.device_id }));
+    const assignedLines = await Line.find({}, "machineId").lean();
+    const assignedInjections = await InjectionMachine.find({}, "machineId").lean();
+    const assignedCounters = await Counter.find({}, "counterId").lean();
 
-    return res.status(200).json({ success: true, data: machines });
+    const assignedMachines = new Set(
+      [...assignedLines.map((line) => line.machineId), ...assignedInjections.map((machine) => machine.machineId), ...assignedCounters.map((counter) => counter.counterId)].filter(Boolean).map(String),
+    );
+
+    const availableMachines = (
+      await Promise.all(
+        machineIds.map(async (machineId) => {
+          if (assignedMachines.has(machineId)) return null;
+
+          const health = await getMachineHealth(machineId);
+          const liveSnapshot = await get(ref(rtdb, `Machines/${machineId}/LiveStatus`));
+          const live = liveSnapshot.exists() ? liveSnapshot.val() : {};
+
+          return {
+            machineId,
+            machineName: health?.machineName || live?.machineName || machineId,
+            status: health?.status || live?.status || "offline",
+            machineState: live?.machineState || health?.machineState || "idle",
+          };
+        }),
+      )
+    ).filter(Boolean);
+
+    return res.status(200).json({
+      success: true,
+      count: availableMachines.length,
+      data: availableMachines,
+    });
   } catch (error) {
     console.error("GET MACHINES ERROR:", error);
     return res.status(500).json({ success: false, message: error.message });

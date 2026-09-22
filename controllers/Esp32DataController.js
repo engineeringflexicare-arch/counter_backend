@@ -305,24 +305,75 @@ const getOptimizedConfig = async (machineId, lineId, logicalDate) => {
 // 3.1 MEMORY-SAFE FIREBASE HELPERS
 // ============================================================================
 
-// IMPORTANT: Never read Machines/ as a whole. CounterHistory can grow very large.
-// Machine IDs are discovered from the application's MongoDB registry instead.
-const getKnownMachineIds = async () => cached("machine-ids", 15_000, async () => {
-  const [lineIds, injectionIds, counterIds] = await Promise.all([
-    LineModel.distinct("machineId"),
-    InjectionMachineModel.distinct("machineId"),
-    Counter.distinct("counterId"),
-  ]);
-  return [...new Set([...lineIds, ...injectionIds, ...counterIds].filter(Boolean).map(String))];
-});
+// ----------------------------------------------------------------------------
+// Firebase -> MongoDB machine registry synchronization
+// ----------------------------------------------------------------------------
+// Firebase is the source of truth for machine discovery.
+//
+// IMPORTANT:
+// `Machines/{machineId}` may contain a large CounterHistory node. Reading the
+// entire Machines tree is therefore potentially expensive. This implementation
+// reads the Machines root only for discovery, then only reads Health/LiveStatus
+// for individual machines. If CounterHistory becomes very large, the preferred
+// production architecture is to maintain a lightweight Firebase registry node
+// such as `MachineRegistry/{machineId}: true`.
+//
+// MongoDB is used for application/business metadata and assignment state.
+// The sync is idempotent: existing machine records are not overwritten.
+
+const normalizeMachineId = (machineId) => {
+  if (machineId === null || machineId === undefined) return null;
+  const value = String(machineId).trim();
+  return value || null;
+};
+
+const syncMachinesFromFirebase = async () =>
+  cached("firebase-machine-sync", 15_000, async () => {
+    const machinesRef = ref(rtdb, "Machines");
+    const snapshot = await get(machinesRef);
+
+    if (!snapshot.exists()) {
+      return [];
+    }
+
+    const machines = snapshot.val() || {};
+    const machineIds = Object.keys(machines).map(normalizeMachineId).filter(Boolean);
+
+    if (machineIds.length === 0) {
+      return [];
+    }
+
+    // Create MongoDB registry records for machines that do not exist yet.
+    // $setOnInsert deliberately avoids overwriting existing business data.
+    await Promise.all(
+      machineIds.map((machineId) =>
+        Counter.updateOne(
+          { counterId: machineId },
+          {
+            $setOnInsert: {
+              counterId: machineId,
+            },
+          },
+          { upsert: true },
+        ),
+      ),
+    );
+
+    return machineIds;
+  });
+
+const getKnownMachineIds = async () => {
+  const firebaseMachineIds = await syncMachinesFromFirebase();
+
+  // Firebase is the source of truth. MongoDB is only used as the persistent
+  // application registry. Do not add Mongo-only IDs to the discovery result.
+  return [...new Set(firebaseMachineIds.map(normalizeMachineId).filter(Boolean))];
+};
 
 const getMachineSnapshot = async (machineId) => {
   if (!machineId) return null;
   return cached(`machine-snapshot:${machineId}`, 2_500, async () => {
-    const [healthSnapshot, liveSnapshot] = await Promise.all([
-      get(ref(rtdb, `Machines/${machineId}/Health`)),
-      get(ref(rtdb, `Machines/${machineId}/LiveStatus`)),
-    ]);
+    const [healthSnapshot, liveSnapshot] = await Promise.all([get(ref(rtdb, `Machines/${machineId}/Health`)), get(ref(rtdb, `Machines/${machineId}/LiveStatus`))]);
     if (!healthSnapshot.exists() && !liveSnapshot.exists()) return null;
     return {
       Health: healthSnapshot.exists() ? healthSnapshot.val() : {},
@@ -434,8 +485,7 @@ async function* iterateRtdbRecords(machineId, logicalDate) {
   }
 }
 
-const archiveExists = async (machineId, logicalDate) =>
-  Boolean(await CounterHistoryArchive.exists({ machineId: String(machineId), date: String(logicalDate) }));
+const archiveExists = async (machineId, logicalDate) => Boolean(await CounterHistoryArchive.exists({ machineId: String(machineId), date: String(logicalDate) }));
 
 async function* iterateCounterHistoryForDate(machineId, logicalDate) {
   if (!machineId || !logicalDate) return;
@@ -581,15 +631,19 @@ const calculateProductionGapsStream = async (machineId, logicalDate, startTime, 
   const gaps = [];
   let previous = null;
   for await (const current of iterateCounterHistoryForShift(machineId, logicalDate, startTime, endTime)) {
-    if (!previous) { previous = current; continue; }
+    if (!previous) {
+      previous = current;
+      continue;
+    }
     const prevCount = Number(previous.Count);
     const currCount = Number(current.Count);
     if (Number.isFinite(prevCount) && Number.isFinite(currCount) && currCount > prevCount) {
       const prevTs = toTimestampSeconds(previous);
       const currTs = toTimestampSeconds(current);
-      const gapSeconds = Number.isFinite(prevTs) && Number.isFinite(currTs)
-        ? currTs - prevTs
-        : (new Date(String(current.Time).replace(/\//g, "-")).getTime() - new Date(String(previous.Time).replace(/\//g, "-")).getTime()) / 1000;
+      const gapSeconds =
+        Number.isFinite(prevTs) && Number.isFinite(currTs)
+          ? currTs - prevTs
+          : (new Date(String(current.Time).replace(/\//g, "-")).getTime() - new Date(String(previous.Time).replace(/\//g, "-")).getTime()) / 1000;
       if (gapSeconds >= 0) gaps.push({ count: (currCount - prevCount) * cavity, time: String(current.Time || "").split(" ")[1] || "—", gapSeconds: Math.round(gapSeconds) });
     }
     previous = current;
@@ -612,10 +666,12 @@ const getCounterHistoryForDate = async (machineId, logicalDate) => {
 export const getAllData = async (req, res) => {
   try {
     const machineIds = await getKnownMachineIds();
-    const results = await Promise.all(machineIds.map(async (machineId) => {
-      const data = await getMachineSnapshot(machineId);
-      return data ? { machineId, ...data } : null;
-    }));
+    const results = await Promise.all(
+      machineIds.map(async (machineId) => {
+        const data = await getMachineSnapshot(machineId);
+        return data ? { machineId, ...data } : null;
+      }),
+    );
 
     return res.status(200).json({
       success: true,
@@ -655,10 +711,12 @@ export const getMachineData = async (req, res) => {
 export const getCounterHistory = async (req, res) => {
   try {
     const { machineId } = req.params;
-    const targetDate = req.query.date || (() => {
-      const now = new Date();
-      return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-    })();
+    const targetDate =
+      req.query.date ||
+      (() => {
+        const now = new Date();
+        return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+      })();
 
     const historyData = await getCounterHistoryForDate(machineId, targetDate);
 
@@ -761,9 +819,10 @@ export const getCombinedProductionGaps = async (req, res) => {
     const logicalDate = getLogicalShiftDate(date, startTime, endTime);
 
     const gapData = await cached(`production-gaps:${targetMachineId}:${logicalDate}:${startTime}:${endTime}:${cavity}`, 15_000, () =>
-      calculateProductionGapsStream(targetMachineId, logicalDate, startTime, endTime, cavity)
+      calculateProductionGapsStream(targetMachineId, logicalDate, startTime, endTime, cavity),
     );
-    if (gapData.length === 0) return res.status(200).json({ success: true, lineId: lineId || null, machineId: targetMachineId, date: logicalDate, startTime, endTime, dailyTarget, averageGap: 0, data: [] });
+    if (gapData.length === 0)
+      return res.status(200).json({ success: true, lineId: lineId || null, machineId: targetMachineId, date: logicalDate, startTime, endTime, dailyTarget, averageGap: 0, data: [] });
 
     let plannedAverageGap = 0;
     if (dailyTarget > 0) {
@@ -794,38 +853,83 @@ export const getCombinedProductionGaps = async (req, res) => {
 // 7. OTHER HELPERS (FREE MACHINES, CRON JOBS, ETC)
 // ============================================================================
 
-
 // ============================================================================
 // 7. OTHER HELPERS (FREE MACHINES, CRON JOBS, ETC)
 // ============================================================================
 
-export const getFreeCounterMachines = async (req, res) => {
+export const syncFirebaseMachines = async (req, res) => {
   try {
-    const machineIds = await getKnownMachineIds();
-    const machineEntries = await Promise.all(machineIds.map(async (machineId) => {
-      const data = await getMachineSnapshot(machineId);
-      return [machineId, data || {}];
-    }));
+    const machineIds = await syncMachinesFromFirebase();
+
+    return res.status(200).json({
+      success: true,
+      count: machineIds.length,
+      machineIds,
+      message: "Firebase machines synchronized with MongoDB successfully.",
+    });
+  } catch (error) {
+    console.error("❌ syncFirebaseMachines:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Failed to synchronize Firebase machines",
+    });
+  }
+};
+
+export const getAvailableMachines = async (req, res) => {
+  try {
+    // Firebase is the source of truth for which machines exist.
+    const machineIds = await syncMachinesFromFirebase();
+
+    // Read current Firebase status for every discovered machine.
+    const machineEntries = await Promise.all(
+      machineIds.map(async (machineId) => {
+        const data = await getMachineSnapshot(machineId);
+        return [machineId, data || {}];
+      }),
+    );
+
     const machines = Object.fromEntries(machineEntries);
 
-    const assignedLines = await Line.find({}, "machineId").select("machineId").lean();
-    const assignedInjections = await InjectionMachine.find({}, "machineId").select("machineId").lean();
+    // MongoDB is responsible only for application assignment state.
+    const [assignedLines, assignedInjections] = await Promise.all([Line.find({}, "machineId").lean(), InjectionMachine.find({}, "machineId").lean()]);
 
-    const assignedMachines = new Set([...assignedLines.map((l) => l.machineId).filter(Boolean), ...assignedInjections.map((im) => im.machineId).filter(Boolean)]);
+    const assignedMachines = new Set([
+      ...assignedLines.map((line) => normalizeMachineId(line.machineId)).filter(Boolean),
+      ...assignedInjections.map((machine) => normalizeMachineId(machine.machineId)).filter(Boolean),
+    ]);
 
     const freeMachines = Object.entries(machines)
       .filter(([machineId]) => !assignedMachines.has(machineId))
-      .map(([machineId, machine]) => ({
-        machineId,
-        machineName: machine.machineName || machineId,
-        status: machine.status || "offline",
-        machineState: machine.machineState || "idle",
-      }));
+      .map(([machineId, machine]) => {
+        const health = machine?.Health || {};
+        const live = machine?.LiveStatus || {};
 
-    return res.status(200).json({ success: true, count: freeMachines.length, data: freeMachines });
+        return {
+          machineId,
+          machineName: health.machineName || live.machineName || machineId,
+          status: health.status || live.status || "offline",
+          machineState: live.machineState || health.machineState || "idle",
+        };
+      });
+
+    return res.status(200).json({
+      success: true,
+      count: freeMachines.length,
+      data: freeMachines,
+    });
   } catch (error) {
-    res.status(500).json({ success: false, message: "Server Error" });
+    console.error("❌ getAvailableMachines:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Server Error",
+    });
   }
+};
+
+export const getFreeCounterMachines = async (req, res) => {
+  return getAvailableMachines(req, res);
 };
 
 export const getLiveDataByLineId = async (req, res) => {
@@ -859,11 +963,15 @@ export const getMachineStatus = async (req, res) => {
 
     // Read only Health + LiveStatus for each machine. CounterHistory is never loaded.
     const data = await cached("machine-status-response", 2_500, async () => {
-      return (await Promise.all(machineIds.map(async (machineId) => {
-        const machine = await getMachineSnapshot(machineId);
-        if (!machine) return null;
-        return { machineId, ...(machine.Health || {}), liveCount: Number(machine.LiveStatus?.Count ?? 0) };
-      }))).filter(Boolean);
+      return (
+        await Promise.all(
+          machineIds.map(async (machineId) => {
+            const machine = await getMachineSnapshot(machineId);
+            if (!machine) return null;
+            return { machineId, ...(machine.Health || {}), liveCount: Number(machine.LiveStatus?.Count ?? 0) };
+          }),
+        )
+      ).filter(Boolean);
     });
     return res.status(200).json({ success: true, data });
   } catch (error) {
