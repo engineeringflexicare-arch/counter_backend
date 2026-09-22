@@ -345,18 +345,34 @@ const syncMachinesFromFirebase = async () =>
 
     // Create MongoDB registry records for machines that do not exist yet.
     // $setOnInsert deliberately avoids overwriting existing business data.
-    await Promise.all(
-      machineIds.map((machineId) =>
-        Counter.updateOne(
+    const syncResults = await Promise.all(
+      machineIds.map(async (machineId) => {
+        const firebaseMachine = machines[machineId] || {};
+        const health = firebaseMachine?.Health || {};
+        const live = firebaseMachine?.LiveStatus || {};
+
+        const result = await Counter.updateOne(
           { counterId: machineId },
           {
             $setOnInsert: {
               counterId: machineId,
+              counterName: health.machineName || live.machineName || machineId,
+              firmwareVersion: health.firmwareVersion || health.version || "1.0.0",
+              ipAddress: health.ipAddress || health.ip || "",
+              macAddress: health.macAddress || health.mac || "",
+              status: "Active",
+              isOnline: String(health.status || live.status || "").toLowerCase() === "online",
+              lastSeen: Number.isFinite(Number(health.lastSeen)) ? new Date(Number(health.lastSeen)) : null,
             },
           },
           { upsert: true },
-        ),
-      ),
+        );
+
+        return {
+          machineId,
+          created: result.upsertedCount === 1,
+        };
+      }),
     );
 
     return machineIds;
