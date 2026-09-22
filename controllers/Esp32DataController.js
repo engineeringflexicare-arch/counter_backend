@@ -327,53 +327,90 @@ const normalizeMachineId = (machineId) => {
   return value || null;
 };
 
-const syncMachinesFromFirebase = async () =>
-  cached("firebase-machine-sync", 15_000, async () => {
-    const machinesRef = ref(rtdb, "Machines");
-    const snapshot = await get(machinesRef);
+// IMPORTANT: Do NOT use get(ref(rtdb, "Machines")) here.
+// The Machines root contains CounterHistory under each machine, so a normal
+// Firebase SDK get() can download the entire tree into Node.js memory. On the
+// Render production instance this can exhaust the ~256 MB heap.
+//
+// Firebase REST API supports `shallow=true`, which returns only the immediate
+// child keys. Example response:
+// { "Machine_01": true, "Machine_02": true }
+// No Health, LiveStatus or CounterHistory data is loaded by this call.
+const getFirebaseMachineIds = async () => {
+  const databaseUrl = process.env.DATABASE_URL?.trim();
 
-    if (!snapshot.exists()) {
+  if (!databaseUrl) {
+    throw new Error("DATABASE_URL environment variable is missing");
+  }
+
+  const baseUrl = databaseUrl.replace(/\/+$/, "");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+
+  try {
+    const response = await fetch(`${baseUrl}/Machines.json?shallow=true`, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+      },
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Firebase machine discovery failed: ${response.status} ${body}`);
+    }
+
+    const data = await response.json();
+
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
       return [];
     }
 
-    const machines = snapshot.val() || {};
-    const machineIds = Object.keys(machines).map(normalizeMachineId).filter(Boolean);
+    return Object.keys(data).map(normalizeMachineId).filter(Boolean);
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error("Firebase machine discovery timed out after 10 seconds");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const syncMachinesFromFirebase = async () =>
+  cached("firebase-machine-sync", 15_000, async () => {
+    const machineIds = await getFirebaseMachineIds();
 
     if (machineIds.length === 0) {
+      console.log("ℹ️ Firebase: no machines found.");
       return [];
     }
 
     // Create MongoDB registry records for machines that do not exist yet.
     // $setOnInsert deliberately avoids overwriting existing business data.
-    const syncResults = await Promise.all(
-      machineIds.map(async (machineId) => {
-        const firebaseMachine = machines[machineId] || {};
-        const health = firebaseMachine?.Health || {};
-        const live = firebaseMachine?.LiveStatus || {};
-
-        const result = await Counter.updateOne(
-          { counterId: machineId },
-          {
-            $setOnInsert: {
-              counterId: machineId,
-              counterName: health.machineName || live.machineName || machineId,
-              firmwareVersion: health.firmwareVersion || health.version || "1.0.0",
-              ipAddress: health.ipAddress || health.ip || "",
-              macAddress: health.macAddress || health.mac || "",
-              status: "Active",
-              isOnline: String(health.status || live.status || "").toLowerCase() === "online",
-              lastSeen: Number.isFinite(Number(health.lastSeen)) ? new Date(Number(health.lastSeen)) : null,
-            },
+    const operations = machineIds.map((machineId) => ({
+      updateOne: {
+        filter: { counterId: machineId },
+        update: {
+          $setOnInsert: {
+            counterId: machineId,
+            counterName: machineId,
+            firmwareVersion: "1.0.0",
+            ipAddress: "",
+            macAddress: "",
+            status: "Active",
+            isOnline: false,
+            lastSeen: null,
           },
-          { upsert: true },
-        );
+        },
+        upsert: true,
+      },
+    }));
 
-        return {
-          machineId,
-          created: result.upsertedCount === 1,
-        };
-      }),
-    );
+    const result = await Counter.bulkWrite(operations, { ordered: false });
+
+    console.log(`🔄 Firebase → MongoDB sync: discovered=${machineIds.length}, created=${result.upsertedCount ?? 0}`);
 
     return machineIds;
   });
